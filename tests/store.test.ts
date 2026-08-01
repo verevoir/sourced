@@ -448,7 +448,11 @@ describe('SourceProxy with persistence', () => {
     const requests = Array.from({ length: N }, () =>
       proxy.getBlob('org/repo', 'sha1', 'src/index.ts')
     );
-    await Promise.resolve(); // let synchronous prime() prologue run
+    // S1 interposes an async store read before the upstream fetch, so one
+    // microtask tick (Promise.resolve) is no longer sufficient to know the
+    // fetch has started.  A setImmediate turn lets the filesystem ENOENT
+    // resolve (cold store) and the promise chain reach fetchTarball.
+    await new Promise((r) => setTimeout(r, 0));
     expect(fetchCount).toBe(1); // only one upstream fetch in flight
 
     releaseResolve();
@@ -470,6 +474,10 @@ describe('SourceProxy with persistence', () => {
     const content = await proxy.getBlob('org/repo', 'sha1', 'src/index.ts');
     expect(getCallCount()).toBe(1); // upstream called because manifest was absent
     expect(content.toString('utf8')).toBe('export const a = 1;\n');
+    // Allow the async write-through to flush before afterEach cleans up the
+    // directory — without this, a concurrent rmdir from Node's recursive rm
+    // races the in-flight writeFile and throws ENOTEMPTY.
+    await new Promise((r) => setTimeout(r, 50));
   });
 
   it('without a store the proxy behaves identically to S0', async () => {
