@@ -1,13 +1,14 @@
 {
-  "name": "@verevoir/sourced-spike",
-  "version": "0.0.1",
+  "name": "@verevoir/sourced",
+  "version": "0.1.0",
   "private": true,
-  "description": "S0 spike: content-addressed source read proxy. Tarball-prime + single-flight + negative caching, in-memory only. Staging area — not a git repo, not published.",
+  "description": "Content-addressed source read proxy: tarball-prime, single-flight, persistent. The hosted read path for verevoir/sourced.",
   "type": "module",
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "verify": "npm run typecheck && npm run test"
   },
   "devDependencies": {
     "@types/node": "^22",
