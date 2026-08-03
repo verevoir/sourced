@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "verevoir": {
+      "command": "node",
+      "args": ["/home/runner/.antagonistic-review-mcp/dist/bin.js"],
+      "env": {
+        "GITHUB_TOKEN": "${GITHUB_TOKEN}"
+      }
+    }
+  }
+}
