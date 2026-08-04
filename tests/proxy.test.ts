@@ -428,3 +428,69 @@ describe('SourceProxy — LRU eviction and maxCachedBytes', () => {
   });
 });
 
+
+describe('SourceProxy — a failed write-through is reported, not swallowed', () => {
+  // A store write that fails costs the CALLER nothing: the snapshot is already
+  // in memory, so the request succeeds either way. That is exactly what makes
+  // swallowing the failure dangerous — a bucket rejecting every write looks
+  // identical to one that is working, while every cold start re-primes from
+  // upstream forever and nobody is ever told.
+
+  /** A store whose reads always miss and whose writes always fail. */
+  function makeBrokenStore() {
+    return {
+      async getBlob() {
+        return null;
+      },
+      async putBlob() {
+        throw new Error('bucket is on fire');
+      },
+      async getTreeManifest() {
+        return null;
+      },
+      async putTreeManifest() {
+        throw new Error('bucket is on fire');
+      },
+      async listSnapshotKeys() {
+        return [];
+      },
+      async deleteSnapshot() {},
+    };
+  }
+
+  it('reports the failure through the injected sink', async () => {
+    const reported: unknown[] = [];
+    const proxy = new SourceProxy(
+      {
+        async fetchTarball() {
+          return buildFakeTarballGz([{ path: 'a.txt', content: 'A' }]);
+        },
+      },
+      { store: makeBrokenStore(), onStoreWriteError: (err) => reported.push(err) }
+    );
+
+    await proxy.getTree('org/repo', 'sha1');
+    // The write-through is deliberately not awaited by the caller, so let the
+    // rejection settle before asserting on it.
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(reported).toHaveLength(1);
+    expect(String(reported[0])).toMatch(/on fire/);
+  });
+
+  it('still serves the request that triggered the failed write', async () => {
+    // Fail-soft: the store is a cache, so losing a write must degrade cost, not
+    // correctness. The caller gets its data.
+    const proxy = new SourceProxy(
+      {
+        async fetchTarball() {
+          return buildFakeTarballGz([{ path: 'a.txt', content: 'A' }]);
+        },
+      },
+      { store: makeBrokenStore(), onStoreWriteError: () => {} }
+    );
+
+    const blob = await proxy.getBlob('org/repo', 'sha1', 'a.txt');
+    expect(blob.toString('utf8')).toBe('A');
+  });
+});

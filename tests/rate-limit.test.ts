@@ -207,3 +207,83 @@ describe('RateLimiter', () => {
     expect(limiter.check('src/b', false).allowed).toBe(true);
   });
 });
+
+describe('RateLimiter — a refused request charges nothing', () => {
+  // The whole point of the two-phase check. Charging budgets one at a time means
+  // a request refused by the SECOND budget has already spent the first, so a
+  // burst of rejections quietly drains an allowance no work ever used.
+
+  it('an expensive request refused by the REQUEST budget does not spend a prime token', () => {
+    // This is the leak that matters, because the prime budget is two orders of
+    // magnitude scarcer: if refused requests burned prime tokens, a caller could
+    // exhaust the whole snapshot allowance without fetching a single snapshot.
+    const clock = { t: 0 };
+    const limiter = new RateLimiter({
+      requestBurst: 1,
+      requestsPerSecond: 1, // one token per 1000ms
+      primeBurst: 2,
+      primesPerSecond: 0.000_001, // effectively frozen for this test
+      now: () => clock.t,
+    });
+
+    // Spend the only request token. The prime budget is untouched at 2.
+    expect(limiter.check('org/repo', false).allowed).toBe(true);
+
+    // Two expensive requests, both refused for want of a REQUEST token.
+    for (let i = 0; i < 2; i++) {
+      expect(limiter.check('org/repo', true)).toMatchObject({
+        allowed: false,
+        limit: 'requests',
+      });
+    }
+
+    // Refill the request budget. The prime budget cannot have refilled.
+    clock.t = 1_000;
+
+    // Had those two refusals each charged a prime token, the budget would now be
+    // empty and this would come back refused with limit 'primes'. It must not.
+    expect(limiter.check('org/repo', true).allowed).toBe(true);
+  });
+
+  it('an expensive request refused by the PRIME budget does not spend a request token', () => {
+    // The mirror image, and the reason the check cannot simply be reordered:
+    // charging in either sequence leaks one of the two budgets.
+    const limiter = new RateLimiter({
+      requestBurst: 5,
+      requestsPerSecond: 0.001,
+      primeBurst: 1,
+      primesPerSecond: 0.001,
+      now: () => 0,
+    });
+
+    limiter.check('org/repo', true); // spends the only prime token
+    for (let i = 0; i < 3; i++) {
+      expect(limiter.check('org/repo', true).limit).toBe('primes');
+    }
+
+    // 5 request tokens, 1 spent by the successful prime. If the three refusals
+    // had each charged one there would be 1 left; there should be 4.
+    for (let i = 0; i < 4; i++) {
+      expect(limiter.check('org/repo', false).allowed).toBe(true);
+    }
+    expect(limiter.check('org/repo', false).allowed).toBe(false);
+  });
+});
+
+describe('TokenBucket — peek', () => {
+  it('reports availability without consuming a token', () => {
+    // `check` relies on this: it peeks every budget before charging any, so a
+    // peek that consumed would reintroduce the leak it exists to prevent.
+    const bucket = new TokenBucket(2, 1, () => 0);
+    expect(bucket.peek().ok).toBe(true);
+    expect(bucket.peek().ok).toBe(true);
+    expect(bucket.available).toBe(2);
+  });
+
+  it('agrees with take about an empty bucket', () => {
+    const bucket = new TokenBucket(1, 1, () => 0);
+    bucket.take();
+    expect(bucket.peek().ok).toBe(false);
+    expect(bucket.peek().retryAfterSeconds).toBeGreaterThan(0);
+  });
+});

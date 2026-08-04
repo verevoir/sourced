@@ -120,14 +120,6 @@ function denySource(
 }
 
 /**
- * Refuse a path that could escape its snapshot, rather than trying to clean it.
- *
- * Sanitising is what produced the hole this replaces: a single-pass strip of
- * `../` turns `....//foo` into `../foo` — it MANUFACTURES the traversal it was
- * meant to remove. Rejection has no such failure mode, and a caller has no
- * legitimate reason to ask for a path outside the tree it just listed.
- */
-/**
  * Charge a request against its source's budget, and refuse it if that budget is
  * spent — with a `Retry-After` the caller can act on, rather than a bare error
  * that invites an immediate retry.
@@ -160,6 +152,14 @@ function denyVolume(
   );
 }
 
+/**
+ * Refuse a path that could escape its snapshot, rather than trying to clean it.
+ *
+ * Sanitising is what produced the hole this replaces: a single-pass strip of
+ * `../` turns `....//foo` into `../foo` — it MANUFACTURES the traversal it was
+ * meant to remove. Rejection has no such failure mode, and a caller has no
+ * legitimate reason to ask for a path outside the tree it just listed.
+ */
 function denyPath(path: string): ProxyResponse | null {
   const normalised = path.replace(/\\/g, '/');
   const traversal = normalised.split('/').some((seg) => seg === '..');

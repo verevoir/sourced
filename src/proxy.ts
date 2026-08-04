@@ -60,6 +60,15 @@ export interface SourceProxyOptions {
   /** Injectable clock, so negative-cache expiry is testable without real
    * timers. Defaults to `Date.now`. */
   now?: () => number;
+  /** Where a failed write-through goes. Defaults to `console.error`.
+   *
+   * It must go SOMEWHERE. A store write that fails costs the caller nothing —
+   * the snapshot is already in memory — which is exactly why swallowing it is
+   * dangerous: a bucket that is failing every write looks identical to one that
+   * is working, while every cold start re-primes from upstream forever and
+   * nobody is told. Injectable so a test can assert it was reported without
+   * writing to the console. */
+  onStoreWriteError?: (err: unknown) => void;
   /** S1: optional persistent store. When provided, a cold start reads from
    * the store before going upstream; a successful prime writes through to
    * the store. When absent the proxy behaves identically to S0. */
@@ -116,6 +125,7 @@ export class SourceProxy {
   private readonly now: () => number;
   private readonly store?: BlobStore;
   private readonly maxCachedBytes: number;
+  private readonly onStoreWriteError: (err: unknown) => void;
 
   /** Successfully primed snapshots, in least-recently-used order — Map iterates
    * in insertion order, so `touch()` re-inserting on every hit makes the FIRST
@@ -149,6 +159,12 @@ export class SourceProxy {
     this.now = options.now ?? Date.now;
     this.store = options.store;
     this.maxCachedBytes = options.maxCachedBytes ?? DEFAULT_MAX_CACHED_BYTES;
+    this.onStoreWriteError =
+      options.onStoreWriteError ??
+      ((err) =>
+        console.error(
+          `store write-through failed (serving from memory): ${err instanceof Error ? err.message : String(err)}`
+        ));
   }
 
   /**
@@ -266,16 +282,14 @@ export class SourceProxy {
       };
       this.admit(key, entry);
 
-      // Write through to the persistent store asynchronously — we don't
-      // block the caller on store writes. A failed write-through is logged
-      // as a concern (the data is still in memory and in-process), but not
-      // surfaced as an error to the caller. The store will be warmed on the
-      // next process restart that serves this (source, sha).
+      // Write through to the persistent store asynchronously — we don't block
+      // the caller on store writes. A failure is REPORTED but not surfaced to
+      // the caller: the data is already in memory, so the request succeeds, and
+      // a future GC run cleans up any partial write. Reporting is what stops a
+      // persistently broken store from being invisible.
       if (this.store) {
         this.writeThrough(source, sha, entry).catch((err: unknown) => {
-          // Not surfaced — in-memory already serves the data. A future GC
-          // run may clean up any partial write.
-          void err;
+          this.onStoreWriteError(err);
         });
       }
 

@@ -62,18 +62,25 @@ export class TokenBucket {
     this.lastRefillMs = now();
   }
 
-  /** Take one token if there is one. Returns whether it was taken, and how long
-   * until the next token if it was not. */
-  take(): { ok: boolean; retryAfterSeconds: number } {
+  /** Whether a token is available, WITHOUT consuming it.
+   *
+   * Exists so a caller spending from more than one bucket can establish that
+   * ALL of them can pay before charging ANY of them — see `RateLimiter.check`. */
+  peek(): { ok: boolean; retryAfterSeconds: number } {
     this.refill();
-    if (this.tokens >= 1) {
-      this.tokens -= 1;
-      return { ok: true, retryAfterSeconds: 0 };
-    }
+    if (this.tokens >= 1) return { ok: true, retryAfterSeconds: 0 };
     // Always at least a second: a Retry-After of 0 invites an immediate retry,
     // which is what we are trying to stop.
     const waitSeconds = (1 - this.tokens) / this.refillPerSecond;
     return { ok: false, retryAfterSeconds: Math.max(1, Math.ceil(waitSeconds)) };
+  }
+
+  /** Take one token if there is one. Returns whether it was taken, and how long
+   * until the next token if it was not. */
+  take(): { ok: boolean; retryAfterSeconds: number } {
+    const verdict = this.peek();
+    if (verdict.ok) this.tokens -= 1;
+    return verdict;
   }
 
   private refill(): void {
@@ -154,12 +161,18 @@ export class RateLimiter {
   check(source: string, expensive: boolean): RateLimitVerdict {
     const bucket = this.bucketsFor(source);
 
-    // Charge the expensive budget FIRST. Taking a token is a side effect, so
-    // checking requests first would spend one on a call the prime budget is
-    // about to refuse — and a caller stuck on the prime limit would drain its
-    // request budget too, turning one throttle into two.
+    // TWO PHASE, and it has to be. Taking a token is a side effect, so charging
+    // the budgets one at a time leaks a token whenever a LATER budget refuses:
+    // the request is rejected, but something was already spent on it and no work
+    // was ever done. Whichever order you pick, one of the two budgets bleeds.
+    //
+    // So establish that every budget this request needs can pay, and only then
+    // charge them. That the prime budget is two orders of magnitude scarcer than
+    // the request budget is what makes the leak matter rather than merely being
+    // untidy — a burst of refused requests could burn the whole prime allowance
+    // without a single snapshot being fetched.
     if (expensive) {
-      const prime = bucket.primes.take();
+      const prime = bucket.primes.peek();
       if (!prime.ok) {
         return {
           allowed: false,
@@ -169,7 +182,7 @@ export class RateLimiter {
       }
     }
 
-    const request = bucket.requests.take();
+    const request = bucket.requests.peek();
     if (!request.ok) {
       return {
         allowed: false,
@@ -178,6 +191,10 @@ export class RateLimiter {
       };
     }
 
+    // Every budget can pay — commit. `peek` has already refilled both against
+    // the same clock reading, so neither `take` can now refuse.
+    if (expensive) bucket.primes.take();
+    bucket.requests.take();
     return ALLOWED;
   }
 
