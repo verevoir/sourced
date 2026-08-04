@@ -122,6 +122,8 @@ Deployed: `ai-gengy-spikes` / `europe-west2`, from source via Cloud Build.
 npm run verify   # typecheck + tests
 ```
 
-`tests/resolve-merge-base.test.ts` currently has two failures that depend on the
-host's locale (tracked as STDIO-637); everything else is green. They are not
-caused by this package's code.
+Two cases in `tests/resolve-merge-base.test.ts` fail **on macOS only** and pass
+in CI, because they assert on a message whose wording depends on the host's
+locale (tracked as STDIO-637). If you see exactly those two red on a Mac, that
+is the known issue and not your change — but confirm the count, because a third
+failure is yours.
