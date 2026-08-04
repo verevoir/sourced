@@ -20,22 +20,18 @@
 //      • `FilesystemBlobStore` — exercises the same interface in tests and
 //        in local dev; vitest uses real `node:fs` on a `os.tmpdir()`
 //        directory, which is fast and does not need credentials.
-//      • `GcsBlobStore` — thin adapter over the GCS JSON API; only used
-//        when a real bucket is configured. Tests NEVER touch it.
+//      • `GcsBlobStore` — thin adapter over the `GcsBucket` port; the only
+//        one used when a real bucket is configured. Tests DO exercise it,
+//        against a fake bucket — what they never touch is real GCS, so no
+//        credentials and no network. Note the fake has to answer the way GCS
+//        actually answers: one that was kinder than the real thing hid a bug
+//        where GC silently collected nothing for as long as it existed.
 //
 // 4. GC POLICY (see `GcPolicy` below). The only safe direction for the
 //    worst-case is "keeps too much"; it must NEVER be "deleted something
 //    still referenced". See the policy's doc comment for the argument.
 
-import {
-  mkdir,
-  readFile,
-  writeFile,
-  readdir,
-  stat,
-  unlink,
-  rmdir,
-} from 'node:fs/promises';
+import { mkdir, readFile, writeFile, readdir, stat, unlink, rmdir } from 'node:fs/promises';
 import { join, dirname } from 'node:path';
 import { createHash } from 'node:crypto';
 import type { TreeEntry } from './tree.js';
@@ -51,9 +47,21 @@ export function blobKey(sourceUrl: string, sha: string, path: string): string {
   // sha component in the path so blobs for the same snapshot are co-located
   // and GC can scan by snapshot.
   const snapshotId = snapshotKey(sourceUrl, sha);
-  // path-within-snapshot: preserve the relative path for human readability
-  // but sanitise it so it can't escape the base directory.
-  const safePath = path.replace(/\.\.\/|\.\.\\/g, '').replace(/^[\/\\]+/, '');
+  // path-within-snapshot: preserve the relative path for human readability, but
+  // REFUSE anything that could escape the snapshot rather than trying to clean it.
+  //
+  // The previous single-pass strip of `../` manufactured the traversal it meant to
+  // remove: `....//foo` -> `../foo`, which then escaped `baseDir` through
+  // `path.join` in the filesystem adapter. Rejection has no such failure mode.
+  // The request boundary rejects these too (see `denyPath` in server.ts); this is
+  // the second line, because a key builder must be safe for every caller, not only
+  // the one that happens to validate first.
+  const safePath = path.replace(/\\/g, '/').replace(/^\/+/, '');
+  if (safePath.split('/').some((seg) => seg === '..') || path.includes('\0')) {
+    throw new Error(
+      `blobKey: refusing a path that could escape its snapshot: ${JSON.stringify(path)}`
+    );
+  }
   return `${snapshotId}/blobs/${safePath}`;
 }
 
@@ -65,9 +73,7 @@ export function treeManifestKey(sourceUrl: string, sha: string): string {
 /** The directory / prefix that contains every blob and the tree manifest
  * for one `(sourceUrl, sha)`. Used by GC to enumerate snapshots. */
 export function snapshotKey(sourceUrl: string, sha: string): string {
-  const hash = createHash('sha256')
-    .update(`${sourceUrl}\0${sha}`)
-    .digest('hex');
+  const hash = createHash('sha256').update(`${sourceUrl}\0${sha}`).digest('hex');
   return `snapshots/${hash}`;
 }
 
@@ -191,6 +197,24 @@ export class MaxAgePolicyMs implements GcPolicy {
   }
 }
 
+export interface GcOptions {
+  /**
+   * Wall-clock ceiling for one whole sweep.
+   *
+   * A sweep costs one manifest read plus possibly a delete PER SNAPSHOT, each
+   * with its own timeout — so bounding the individual calls bounds nothing in
+   * aggregate: a thousand snapshots at thirty seconds each is hours. It runs on
+   * an interval, so a sweep that outlasts its own interval means sweeps overlap
+   * and pile up, each holding connections, until the instance is doing nothing
+   * else. The composition root sets this from the interval it schedules.
+   */
+  budgetMs?: number;
+  /** Injectable clock, so the budget is testable without waiting. */
+  now?: () => number;
+}
+
+const DEFAULT_GC_BUDGET_MS = 120_000;
+
 /**
  * Run one GC sweep: list all snapshots, evaluate each against the policy,
  * and delete those the policy marks as eligible.
@@ -199,16 +223,34 @@ export class MaxAgePolicyMs implements GcPolicy {
  *
  * A failure on one snapshot is logged and skipped rather than aborting the
  * sweep — partial GC success is safe (it leaves extra data, not missing
- * data).
+ * data). Running out of budget is the same kind of safe: the sweep stops early
+ * and says so. There is no cursor, so the next sweep starts from the beginning
+ * rather than resuming — which is why exhausting the budget is LOGGED and not
+ * treated as an ordinary finish. A sweep that never reaches the end leaves a
+ * tail that is never collected.
  */
 export async function runGc(
   store: BlobStore,
   policy: GcPolicy,
-  log: (msg: string) => void = () => {}
+  log: (msg: string) => void = () => {},
+  options: GcOptions = {}
 ): Promise<number> {
+  const budgetMs = options.budgetMs ?? DEFAULT_GC_BUDGET_MS;
+  const now = options.now ?? Date.now;
+  const startedAt = now();
+
   const keys = await store.listSnapshotKeys();
   let deleted = 0;
+  let examined = 0;
   for (const key of keys) {
+    if (now() - startedAt >= budgetMs) {
+      log(
+        `gc: stopped at its ${budgetMs}ms budget after examining ${examined}/${keys.length} ` +
+          `snapshot(s), ${deleted} deleted. The next sweep restarts from the beginning.`
+      );
+      return deleted;
+    }
+    examined++;
     // We need the manifest to evaluate the policy, but the snapshot key is
     // opaque (a hash). Read the manifest directly from the store using the
     // well-known path within the snapshot.
@@ -222,7 +264,9 @@ export async function runGc(
       log(`gc: deleted snapshot ${key}`);
       deleted++;
     } catch (err) {
-      log(`gc: failed to delete snapshot ${key}: ${err instanceof Error ? err.message : String(err)}`);
+      log(
+        `gc: failed to delete snapshot ${key}: ${err instanceof Error ? err.message : String(err)}`
+      );
     }
   }
   return deleted;
@@ -384,7 +428,13 @@ export interface GcsBucket {
   /** Upload a blob idempotently (last-writer-wins is fine — content is
    * identical for the same key). */
   upload(key: string, content: Buffer, contentType: string): Promise<void>;
-  /** List all "directories" (common prefixes) under `snapshots/`. */
+  /** List all "directories" (common prefixes) under `snapshots/`.
+   *
+   * CONTRACT: each entry is `snapshots/<id>` with NO trailing delimiter. GCS
+   * itself returns common prefixes WITH one, so an adapter over it must strip
+   * it — `runGc` appends `/_tree.json` to these, and the extra slash produced a
+   * key that matched no stored object. `GcsBlobStore` re-normalises anyway; see
+   * `listSnapshotKeys`. */
   listSnapshotPrefixes(): Promise<string[]>;
   /** Delete all objects whose key starts with `prefix`. */
   deletePrefix(prefix: string): Promise<void>;
@@ -393,10 +443,13 @@ export interface GcsBucket {
 /**
  * A `BlobStore` backed by Google Cloud Storage.
  *
- * **No GCS SDK dependency.** The `GcsBucket` port is injected; the real
- * implementation lives outside this file and is wired at startup. This
- * keeps the package free of a `@google-cloud/storage` dependency that
- * would bloat every consumer — the GCS wiring is the operator's concern.
+ * **No GCS SDK dependency IN THIS FILE.** The package does depend on
+ * `@google-cloud/storage` — the adapter has to talk to something — but the
+ * `GcsBucket` port is injected, so nothing in the core imports the SDK. What
+ * that buys is concrete: this class is testable against a fake with no
+ * credentials, and `gcs-bucket.ts` is loaded by a dynamic import so a
+ * filesystem-backed or in-memory run never pays to load the SDK or authenticate
+ * against it. The GCS wiring stays the operator's concern.
  *
  * Tests never instantiate this class with a real GCS bucket. They either
  * inject a `GcsBucket` fake or use `FilesystemBlobStore` entirely.
@@ -427,11 +480,25 @@ export class GcsBlobStore implements RawBlobStore {
   }
 
   async listSnapshotKeys(): Promise<string[]> {
-    return this.bucket.listSnapshotPrefixes();
+    // Normalised HERE as well as in the adapter, and deliberately so. This is the
+    // boundary `runGc` actually depends on: it appends `/_tree.json` to every key
+    // it gets back, so a trailing delimiter yields `snapshots/<id>//_tree.json`,
+    // which matches nothing. A missing manifest means KEEP, so the failure is
+    // silent — GC reports success and deletes nothing, for as long as nobody
+    // checks the bucket. A guarantee whose breach is invisible is worth
+    // enforcing at the seam that relies on it, not only in the one adapter that
+    // happens to ship today.
+    const keys = await this.bucket.listSnapshotPrefixes();
+    return keys.map((key) => key.replace(/\/+$/, ''));
   }
 
   async deleteSnapshot(snapshotKeyPath: string): Promise<void> {
-    await this.bucket.deletePrefix(snapshotKeyPath);
+    // Trailing slash on purpose. `snapshots/<hash>` as a raw prefix would also
+    // match `snapshots/<hash>anything`; the delimiter confines the delete to
+    // that one snapshot's own objects. Today's keys are fixed-length hashes so
+    // no such sibling can exist — but a delete is the one operation where being
+    // right by accident is not good enough.
+    await this.bucket.deletePrefix(`${snapshotKeyPath.replace(/\/+$/, '')}/`);
   }
 
   async getRawManifest(rawKey: string): Promise<TreeManifest | null> {

@@ -20,6 +20,18 @@
 # merge base exists, or when the diff would be empty.
 set -euo pipefail
 
+# Byte collation, not the host's. The validators below are bracket expressions
+# ([!0-9a-f], [!A-Za-z0-9._/-]) and a range like `a-f` is COLLATION-ordered, not
+# byte-ordered. Under a locale that interleaves case — macOS's default is one —
+# 'A' sorts inside a-f, so `case AAA1111 in *[!0-9a-f]*)` does not match and the
+# sha guard ACCEPTS a non-hex string. That is a fail-open in the one check
+# standing between an attacker-controlled ref and a git command line.
+#
+# Verified: /bin/bash on macOS accepts AAA1111 without this line and rejects it
+# with it. The CI runner happens to reject either way, which is exactly why this
+# went unnoticed — the guard was weakest precisely where nobody was watching.
+export LC_ALL=C
+
 : "${BASE_REF:?}" "${BASE_SHA:?}" "${HEAD_SHA:?}" "${GITHUB_ENV:?}"
 
 # Only bare commit shas (abbreviated or full lowercase hex) — validated before they are

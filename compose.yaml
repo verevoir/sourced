@@ -1,0 +1,64 @@
+# Local run of the SAME image that ships to Cloud Run.
+#
+#   docker compose up --build
+#   curl 'http://localhost:8080/healthz'
+#   curl 'http://localhost:8080/v1/tree?source=verevoir/accelerator&sha=<sha>'
+#
+# The only difference from the deployed service is the store adapter: a mounted
+# volume here, a GCS bucket there. Both satisfy the same `BlobStore` port, so the
+# code path exercised locally is the deployed one — which is the point of running
+# it this way rather than with `npm start` against a different configuration.
+#
+# There is deliberately no second container. The persistence this workload needs
+# is content-addressed blobs, which a filesystem serves directly; a Redis or
+# Postgres alongside would add a moving part with no invariant to protect. The
+# design record rejects Redis for exactly that reason — content-addressed data has
+# no shared mutable state to coordinate.
+
+services:
+  sourced:
+    build: .
+    ports:
+      - '8080:8080'
+    environment:
+      PORT: '8080'
+      # Which sources this service will serve. REQUIRED — empty means deny
+      # everything. The service applies its own GITHUB_TOKEN to whatever source a
+      # caller names, so without this list any caller could read every private
+      # repo that token can read.
+      SOURCED_ALLOWED_SOURCES: ${SOURCED_ALLOWED_SOURCES:-verevoir/accelerator}
+      # Filesystem adapter — the local counterpart of SOURCED_GCS_BUCKET.
+      SOURCED_FS_DIR: /var/cache/sourced
+      # Minutes: this cache exists to stop the same file being fetched thirty
+      # times in one working window, not to store anything. See src/bin.ts.
+      SOURCED_SNAPSHOT_TTL_MS: '1800000'
+      SOURCED_GC_INTERVAL_MS: '300000'
+      # Heap budget for primed snapshots before LRU eviction starts. Kept well
+      # inside the memory limit below, for the same reason it is kept inside the
+      # Cloud Run instance size: the proxy evicts on this number, so setting it
+      # above what the container actually has trades a cache miss for an OOM.
+      SOURCED_MAX_CACHED_BYTES: '134217728'
+      # Optional: only needed to read PRIVATE sources. Passed through from the
+      # host so it is never baked into the image or committed here.
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+    # Matches the deployed Cloud Run instance size. Without it the local run has
+    # the whole host's memory and the eviction budget above never binds — so the
+    # one failure mode the budget exists to prevent would be invisible locally
+    # and only ever appear in the cloud.
+    mem_limit: 512m
+    volumes:
+      # Named rather than bind-mounted: the cache is disposable, and a bind mount
+      # would write root-owned files into the working tree.
+      - sourced-cache:/var/cache/sourced
+    healthcheck:
+      # Matches what Cloud Run and k8s probe, so a container that would fail its
+      # readiness check in the cloud fails here too rather than at deploy time.
+      test:
+        ['CMD', 'node', '-e', "fetch('http://localhost:8080/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  sourced-cache:

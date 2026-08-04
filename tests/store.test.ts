@@ -146,9 +146,7 @@ describe('FilesystemBlobStore', () => {
       sourceUrl: SOURCE,
       sha: SHA,
       createdAt: '2024-01-01T00:00:00.000Z',
-      entries: [
-        { path: 'src/index.ts', type: 'blob', size: 21, sha: 'deadbeef' },
-      ],
+      entries: [{ path: 'src/index.ts', type: 'blob', size: 21, sha: 'deadbeef' }],
     };
     await store.putTreeManifest(SOURCE, SHA, manifest);
     const result = await store.getTreeManifest(SOURCE, SHA);
@@ -434,7 +432,9 @@ describe('SourceProxy with persistence', () => {
     const store = new FilesystemBlobStore(baseDir);
     let fetchCount = 0;
     let releaseResolve!: () => void;
-    const releaseP = new Promise<void>((resolve) => { releaseResolve = resolve; });
+    const releaseP = new Promise<void>((resolve) => {
+      releaseResolve = resolve;
+    });
     const fetcher: TarballFetcher = {
       async fetchTarball() {
         fetchCount++;
@@ -489,5 +489,242 @@ describe('SourceProxy with persistence', () => {
     // Second call — served from in-memory, no second fetch.
     await proxy.getBlob('org/repo', 'sha1', 'src/util.ts');
     expect(getCallCount()).toBe(1);
+  });
+});
+
+describe('blobKey — refuses an escaping path instead of sanitising it', () => {
+  // The regression this replaces: a single-pass strip of `../` MANUFACTURED the
+  // traversal it was meant to remove — `....//foo` became `../foo`, which then
+  // escaped baseDir through path.join in the filesystem adapter.
+  it('never emits a ".." segment for the input that broke the old sanitiser', () => {
+    // `....//foo` is NOT itself a traversal — `....` is an ordinary directory
+    // name. It was only dangerous because the strip rewrote it. Asserting on the
+    // emitted key is what proves the rewrite is gone, rather than asserting a
+    // rejection that would not be correct.
+    const key = blobKey('org/repo', 'sha1', '....//foo');
+    expect(key.split('/')).not.toContain('..');
+  });
+
+  it.each(['../escape', 'a/../../b', '..\\win'])('throws on %s', (path) => {
+    expect(() => blobKey('org/repo', 'sha1', path)).toThrow(/escape its snapshot/);
+  });
+
+  it('makes an absolute path relative rather than throwing — it cannot escape', () => {
+    // Distinct from a `..` segment: a leading slash is neutralised by stripping,
+    // which cannot manufacture a traversal the way the old `../` strip could. The
+    // ROUTE still rejects it outright (see denyPath) — this is the second line,
+    // asserting the key itself is safe rather than that the input was refused.
+    const key = blobKey('org/repo', 'sha1', '/abs');
+    expect(key.split('/')).not.toContain('..');
+    expect(key).toMatch(/\/blobs\/abs$/);
+  });
+
+  it('still builds a key for a legitimate nested path', () => {
+    expect(blobKey('org/repo', 'sha1', 'src/index.ts')).toMatch(/\/blobs\/src\/index\.ts$/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GC over a bucket that answers the way REAL GCS answers
+// ---------------------------------------------------------------------------
+
+describe('runGc over GcsBlobStore — GCS returns prefixes WITH their delimiter', () => {
+  // Why this exists: `makeFakeGcsBucket` above returns `snapshots/<hash>`, but
+  // real GCS returns a common prefix as `snapshots/<hash>/` — with the
+  // delimiter. `runGc` appends `/_tree.json` to whatever it is given, so the
+  // real shape produced `snapshots/<hash>//_tree.json`, which matches no stored
+  // object. A missing manifest means KEEP, so GC read every snapshot as
+  // unevaluable and deleted nothing — silently, for as long as it has existed,
+  // while looking entirely healthy.
+  //
+  // The fake being kinder than the real thing is what hid it. This one is not.
+
+  function makeGcsFaithfulBucket(): GcsBucket & { objects: Map<string, Buffer> } {
+    const objects = new Map<string, Buffer>();
+    return {
+      objects,
+      async download(key) {
+        return objects.get(key) ?? null;
+      },
+      async upload(key, content) {
+        objects.set(key, content);
+      },
+      async listSnapshotPrefixes() {
+        const prefixes = new Set<string>();
+        for (const key of objects.keys()) {
+          const match = /^(snapshots\/[^/]+\/)/.exec(key); // note: keeps the slash
+          if (match) prefixes.add(match[1]!);
+        }
+        return [...prefixes];
+      },
+      async deletePrefix(prefix) {
+        for (const key of [...objects.keys()]) {
+          if (key.startsWith(prefix)) objects.delete(key);
+        }
+      },
+    };
+  }
+
+  it('actually deletes an expired snapshot', async () => {
+    const bucket = makeGcsFaithfulBucket();
+    const store = new GcsBlobStore(bucket);
+    const now = Date.parse('2026-01-01T00:00:00Z');
+
+    await store.putBlob('org/repo', 'sha1', 'a.txt', Buffer.from('A'));
+    await store.putTreeManifest('org/repo', 'sha1', {
+      sourceUrl: 'org/repo',
+      sha: 'sha1',
+      createdAt: new Date(now - 60 * 60_000).toISOString(), // an hour old
+      entries: [{ path: 'a.txt', type: 'blob', sha: 'blobsha' }],
+    });
+    expect(bucket.objects.size).toBeGreaterThan(0);
+
+    const deleted = await runGc(store, new MaxAgePolicyMs(30 * 60_000, () => now));
+
+    expect(deleted).toBe(1);
+    expect(bucket.objects.size).toBe(0);
+  });
+
+  it('keeps a snapshot that is still within its TTL', async () => {
+    // The other direction matters just as much: a GC that deletes a live
+    // snapshot costs an upstream re-prime for every caller still naming its sha.
+    const bucket = makeGcsFaithfulBucket();
+    const store = new GcsBlobStore(bucket);
+    const now = Date.parse('2026-01-01T00:00:00Z');
+
+    await store.putBlob('org/repo', 'sha1', 'a.txt', Buffer.from('A'));
+    await store.putTreeManifest('org/repo', 'sha1', {
+      sourceUrl: 'org/repo',
+      sha: 'sha1',
+      createdAt: new Date(now - 60_000).toISOString(), // a minute old
+      entries: [{ path: 'a.txt', type: 'blob', sha: 'blobsha' }],
+    });
+
+    const deleted = await runGc(store, new MaxAgePolicyMs(30 * 60_000, () => now));
+
+    expect(deleted).toBe(0);
+    expect(bucket.objects.size).toBe(2);
+  });
+
+  it('deleting one snapshot leaves another untouched', async () => {
+    // deleteSnapshot uses a prefix, and a prefix delete that reached a sibling
+    // would destroy live data — the one failure mode here that is not recoverable
+    // by re-priming a single key.
+    const bucket = makeGcsFaithfulBucket();
+    const store = new GcsBlobStore(bucket);
+    const now = Date.parse('2026-01-01T00:00:00Z');
+
+    for (const [sha, ageMs] of [
+      ['old', 60 * 60_000],
+      ['new', 60_000],
+    ] as const) {
+      await store.putBlob('org/repo', sha, 'a.txt', Buffer.from(sha));
+      await store.putTreeManifest('org/repo', sha, {
+        sourceUrl: 'org/repo',
+        sha,
+        createdAt: new Date(now - ageMs).toISOString(),
+        entries: [{ path: 'a.txt', type: 'blob', sha: 'blobsha' }],
+      });
+    }
+
+    await runGc(store, new MaxAgePolicyMs(30 * 60_000, () => now));
+
+    expect(await store.getBlob('org/repo', 'new', 'a.txt')).toEqual(Buffer.from('new'));
+    expect(await store.getBlob('org/repo', 'old', 'a.txt')).toBeNull();
+  });
+});
+
+describe('runGc — a sweep is bounded in wall-clock, not just per call', () => {
+  // Per-operation timeouts bound nothing in aggregate: a sweep costs a manifest
+  // read plus possibly a delete PER SNAPSHOT, so a thousand snapshots at thirty
+  // seconds each is hours. GC runs on an interval, so a sweep that outlasts its
+  // own interval means sweeps overlap and pile up until the instance is doing
+  // nothing else.
+
+  /** A store with `count` snapshots, all old enough to delete, whose clock
+   * advances by `msPerSnapshot` on every manifest read. */
+  function makeSlowStore(count: number, msPerSnapshot: number, clock: { t: number }) {
+    const deletedKeys: string[] = [];
+    const store: RawBlobStore = {
+      async getBlob() {
+        return null;
+      },
+      async putBlob() {},
+      async getTreeManifest() {
+        return null;
+      },
+      async putTreeManifest() {},
+      async listSnapshotKeys() {
+        return Array.from({ length: count }, (_, i) => `snapshots/s${i}`);
+      },
+      async deleteSnapshot(key) {
+        deletedKeys.push(key);
+      },
+      async getRawManifest() {
+        clock.t += msPerSnapshot;
+        return {
+          sourceUrl: 'org/repo',
+          sha: 'sha',
+          createdAt: new Date(0).toISOString(), // ancient — always collectable
+          entries: [],
+        };
+      },
+    };
+    return { store, deletedKeys };
+  }
+
+  // Start the clock well past the epoch so the ancient manifests below are
+  // genuinely older than the policy's max age when measured against it.
+  const START = 10_000_000;
+
+  it('stops when the budget is spent rather than running to the end', async () => {
+    const clock = { t: START };
+    const { store, deletedKeys } = makeSlowStore(100, 10, clock);
+
+    const deleted = await runGc(store, new MaxAgePolicyMs(1_000, () => clock.t), () => {}, {
+      budgetMs: 50,
+      now: () => clock.t,
+    });
+
+    // 50ms of budget at 10ms a snapshot: a handful, not all hundred.
+    expect(deleted).toBeGreaterThan(0);
+    expect(deleted).toBeLessThan(100);
+    expect(deletedKeys).toHaveLength(deleted);
+  });
+
+  it('says so when it stops early, rather than reporting a clean finish', async () => {
+    // There is no cursor: the next sweep restarts from the beginning, so a sweep
+    // that never reaches the end leaves a tail that is NEVER collected. Silent
+    // truncation would read as "the bucket is tidy" while it quietly grows.
+    const clock = { t: START };
+    const { store } = makeSlowStore(100, 10, clock);
+    const logged: string[] = [];
+
+    await runGc(store, new MaxAgePolicyMs(1_000, () => clock.t), (m) => logged.push(m), {
+      budgetMs: 50,
+      now: () => clock.t,
+    });
+
+    expect(logged.some((m) => /budget/.test(m) && /restarts from the beginning/.test(m))).toBe(
+      true
+    );
+  });
+
+  it('completes normally and logs no truncation when the budget is ample', async () => {
+    // The bound must not fire on an ordinary sweep, or every healthy run would
+    // look like a degraded one.
+    const clock = { t: START };
+    const { store } = makeSlowStore(5, 1, clock);
+    const logged: string[] = [];
+
+    const deleted = await runGc(
+      store,
+      new MaxAgePolicyMs(1_000, () => clock.t),
+      (m) => logged.push(m),
+      { budgetMs: 60_000, now: () => clock.t }
+    );
+
+    expect(deleted).toBe(5);
+    expect(logged.some((m) => /budget/.test(m))).toBe(false);
   });
 });
