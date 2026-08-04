@@ -99,3 +99,68 @@ describe('handleRequest — a burst through the HTTP layer still primes once', (
     expect(results.every((r) => r.status === 200)).toBe(true);
   });
 });
+
+describe('handleRequest — /healthz', () => {
+  // The platform (Cloud Run, k8s, compose) probes this to decide whether the
+  // container is alive. Every assertion here is something a probe or an operator
+  // depends on.
+  // Both spellings, because the probe path is the platform's choice: k8s and
+  // Cloud Run conventionally use /healthz, load balancers and compose
+  // healthchecks often use /health. One image runs in all of them.
+  it.each(['/healthz', '/health'])('200s and reports up on %s', async (path) => {
+    const res = await handleRequest(makeProxy(), 'GET', path);
+    expect(res.status).toBe(200);
+    expect(JSON.parse(String(res.body)).status).toBe('ok');
+  });
+
+  it('does not treat a trailing slash as the health route', async () => {
+    // Exact match only — a prefix match would make /healthz-anything answer ok.
+    expect((await handleRequest(makeProxy(), 'GET', '/healthz/')).status).toBe(404);
+  });
+
+  it('reports the build and the store it was wired with', async () => {
+    // "Which build are you, and what are you talking to" — without this an
+    // operator cannot tell a stale revision from a current one, or a run that
+    // silently fell back to memory from one using its bucket.
+    const res = await handleRequest(makeProxy(), 'GET', '/healthz', {
+      version: '9.9.9',
+      revision: 'sourced-00042-abc',
+      store: 'gcs',
+    });
+    const body = JSON.parse(String(res.body));
+    expect(body).toMatchObject({ version: '9.9.9', revision: 'sourced-00042-abc', store: 'gcs' });
+  });
+
+  it('degrades to "unknown" rather than lying when no info is supplied', async () => {
+    const body = JSON.parse(String((await handleRequest(makeProxy(), 'GET', '/healthz')).body));
+    expect(body.version).toBe('unknown');
+    expect(body.store).toBe('unknown');
+    expect(body.revision).toBeNull();
+  });
+
+  it('states that it is liveness only, so nobody reads it as a dependency probe', async () => {
+    // Load-bearing honesty: a green /healthz says the process is up, NOT that GCS
+    // or GitHub are reachable. Probing them here would turn a dependency blip into
+    // a restart loop of a process still able to serve its cached snapshots.
+    const body = JSON.parse(String((await handleRequest(makeProxy(), 'GET', '/healthz')).body));
+    expect(body.checks).toMatch(/liveness only/);
+  });
+
+  it('answers without touching the proxy at all', async () => {
+    // A health check that primes a snapshot would make the probe itself expensive
+    // and could fail on an upstream outage the check is not meant to report.
+    let touched = false;
+    const fetcher: TarballFetcher = {
+      async fetchTarball() {
+        touched = true;
+        return buildFakeTarballGz([{ path: 'a', content: 'a' }]);
+      },
+    };
+    await handleRequest(new SourceProxy(fetcher), 'GET', '/healthz');
+    expect(touched).toBe(false);
+  });
+
+  it('is GET-only like every other route', async () => {
+    expect((await handleRequest(makeProxy(), 'POST', '/healthz')).status).toBe(405);
+  });
+});

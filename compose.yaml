@@ -1,0 +1,49 @@
+# Local run of the SAME image that ships to Cloud Run.
+#
+#   docker compose up --build
+#   curl 'http://localhost:8080/healthz'
+#   curl 'http://localhost:8080/v1/tree?source=verevoir/accelerator&sha=<sha>'
+#
+# The only difference from the deployed service is the store adapter: a mounted
+# volume here, a GCS bucket there. Both satisfy the same `BlobStore` port, so the
+# code path exercised locally is the deployed one — which is the point of running
+# it this way rather than with `npm start` against a different configuration.
+#
+# There is deliberately no second container. The persistence this workload needs
+# is content-addressed blobs, which a filesystem serves directly; a Redis or
+# Postgres alongside would add a moving part with no invariant to protect. The
+# design record rejects Redis for exactly that reason — content-addressed data has
+# no shared mutable state to coordinate.
+
+services:
+  sourced:
+    build: .
+    ports:
+      - '8080:8080'
+    environment:
+      PORT: '8080'
+      # Filesystem adapter — the local counterpart of SOURCED_GCS_BUCKET.
+      SOURCED_FS_DIR: /var/cache/sourced
+      # Minutes: this cache exists to stop the same file being fetched thirty
+      # times in one working window, not to store anything. See src/bin.ts.
+      SOURCED_SNAPSHOT_TTL_MS: '1800000'
+      SOURCED_GC_INTERVAL_MS: '300000'
+      # Optional: only needed to read PRIVATE sources. Passed through from the
+      # host so it is never baked into the image or committed here.
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+    volumes:
+      # Named rather than bind-mounted: the cache is disposable, and a bind mount
+      # would write root-owned files into the working tree.
+      - sourced-cache:/var/cache/sourced
+    healthcheck:
+      # Matches what Cloud Run and k8s probe, so a container that would fail its
+      # readiness check in the cloud fails here too rather than at deploy time.
+      test:
+        ['CMD', 'node', '-e', "fetch('http://localhost:8080/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  sourced-cache:

@@ -20,6 +20,18 @@ export interface ProxyResponse {
   body: Buffer | string;
 }
 
+/** What `/healthz` reports: up, which build, and which store is wired in.
+ * Supplied by the composition root, because the server itself has no way to
+ * know any of it. */
+export interface ServiceInfo {
+  /** Package version of the running build. */
+  version: string;
+  /** Deployment identity where the platform provides one (Cloud Run revision). */
+  revision?: string;
+  /** Which persistence adapter this process was started with. */
+  store: 'memory' | 'filesystem' | 'gcs';
+}
+
 function jsonResponse(status: number, body: unknown): ProxyResponse {
   return {
     status,
@@ -60,7 +72,8 @@ function requireParams(
 export async function handleRequest(
   proxy: SourceProxy,
   method: string,
-  url: string
+  url: string,
+  info?: ServiceInfo
 ): Promise<ProxyResponse> {
   if (method !== 'GET') {
     return jsonResponse(405, { error: 'method_not_allowed' });
@@ -70,6 +83,28 @@ export async function handleRequest(
   // never used (only `.pathname`/`.searchParams` are read), so any origin
   // does.
   const parsed = new URL(url, 'http://sourced.internal');
+
+  // LIVENESS, deliberately not a dependency probe. It answers "am I up, which
+  // build am I, and what am I wired to" without touching GCS or GitHub.
+  //
+  // Probing the store here would make every liveness check a paid round-trip and
+  // turn a transient dependency blip into a restart loop — the platform would kill
+  // a process that is perfectly capable of serving the cached snapshots it already
+  // holds. Upstream health is reported where it is actually observed: a failing
+  // fetch surfaces as a 502 on the route that needed it.
+  // Both spellings, because the probe path is the platform's choice, not ours:
+  // k8s and Cloud Run conventionally use /healthz, many load balancers and
+  // compose healthchecks use /health. One image runs in all of them, so it
+  // answers to both rather than making the deployment carry the difference.
+  if (parsed.pathname === '/healthz' || parsed.pathname === '/health') {
+    return jsonResponse(200, {
+      status: 'ok',
+      version: info?.version ?? 'unknown',
+      revision: info?.revision ?? null,
+      store: info?.store ?? 'unknown',
+      checks: 'liveness only — this endpoint does not probe the store or upstream',
+    });
+  }
 
   if (parsed.pathname === '/v1/blob') {
     const params = requireParams(parsed.searchParams, ['source', 'sha', 'path']);
@@ -103,10 +138,19 @@ export async function handleRequest(
 /** Thin `node:http` wrapper around `handleRequest` — what an operator
  * actually runs. Not exercised by the test suite (see module doc); the
  * behaviour it depends on is fully covered via `handleRequest` directly. */
-export function createServer(proxy: SourceProxy) {
+export function createServer(proxy: SourceProxy, info?: ServiceInfo) {
   return createHttpServer(async (req: IncomingMessage, res: ServerResponse) => {
-    const response = await handleRequest(proxy, req.method ?? 'GET', req.url ?? '/');
-    res.writeHead(response.status, response.headers);
-    res.end(response.body);
+    // A throw here would take down the whole process via node:http's
+    // 'uncaughtException' path, so one bad request cannot be allowed to become an
+    // outage: every failure is mapped to a 500 the client can read.
+    try {
+      const response = await handleRequest(proxy, req.method ?? 'GET', req.url ?? '/', info);
+      res.writeHead(response.status, response.headers);
+      res.end(response.body);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      res.writeHead(500, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'internal_error', message }));
+    }
   });
 }
