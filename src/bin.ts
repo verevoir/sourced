@@ -8,14 +8,10 @@
 
 import { SourceProxy } from './proxy.js';
 import { GithubCodeloadFetcher } from './fetcher.js';
+import { RateLimiter } from './rate-limit.js';
 import { createServer, type ServiceInfo } from './server.js';
-import {
-  FilesystemBlobStore,
-  GcsBlobStore,
-  MaxAgePolicyMs,
-  runGc,
-  type BlobStore,
-} from './store.js';
+import { buildStore } from './build-store.js';
+import { MaxAgePolicyMs, runGc } from './store.js';
 
 const PORT = Number(process.env.PORT ?? 8080);
 
@@ -39,31 +35,11 @@ const PORT = Number(process.env.PORT ?? 8080);
 const SNAPSHOT_TTL_MS = Number(process.env.SOURCED_SNAPSHOT_TTL_MS ?? 30 * 60_000);
 const GC_INTERVAL_MS = Number(process.env.SOURCED_GC_INTERVAL_MS ?? 5 * 60_000);
 
-async function buildStore(): Promise<{
-  store?: BlobStore;
-  kind: ServiceInfo['store'];
-}> {
-  const bucket = process.env.SOURCED_GCS_BUCKET?.trim();
-  const dir = process.env.SOURCED_FS_DIR?.trim();
-
-  // Explicit over clever: naming both is a configuration mistake, and guessing
-  // which was meant would silently write a run's cache somewhere nobody expects.
-  if (bucket && dir) {
-    throw new Error('configure SOURCED_GCS_BUCKET or SOURCED_FS_DIR, not both');
-  }
-  if (bucket) {
-    // Imported lazily so the storage SDK is never loaded — or required to
-    // authenticate — by a filesystem-backed or in-memory run. This is a dynamic
-    // import, not require: the package is ESM and require is not defined here.
-    const { GoogleCloudBucket } = await import('./gcs-bucket.js');
-    return {
-      store: new GcsBlobStore(new GoogleCloudBucket({ bucket })),
-      kind: 'gcs',
-    };
-  }
-  if (dir) return { store: new FilesystemBlobStore(dir), kind: 'filesystem' };
-  return { store: undefined, kind: 'memory' };
-}
+// Heap ceiling for primed snapshots. Raise it WITH the instance's memory, never
+// past it: the proxy evicts on this number, so setting it above what the
+// container actually has replaces a cache miss with an OOM. Zero/unset takes the
+// proxy's own default. See `DEFAULT_MAX_CACHED_BYTES` in proxy.ts.
+const MAX_CACHED_BYTES = Number(process.env.SOURCED_MAX_CACHED_BYTES ?? 0) || undefined;
 
 const { store, kind } = await buildStore();
 
@@ -87,9 +63,15 @@ const allowedSources = new Set(
 
 const proxy = new SourceProxy(new GithubCodeloadFetcher({ token: process.env.GITHUB_TOKEN }), {
   store,
+  maxCachedBytes: MAX_CACHED_BYTES,
 });
 
-const server = createServer(proxy, { info, allowedSources });
+// The application half of the volume defence. The other half is the deployment's
+// — ingress restriction, IAM invoker check and a max-instances ceiling — and
+// neither is sufficient alone; see rate-limit.ts and README.md.
+const rateLimiter = new RateLimiter();
+
+const server = createServer(proxy, { info, allowedSources, rateLimiter });
 
 // GC only runs where there is something durable to collect: an in-memory run has
 // no store to sweep, and a sweep against `undefined` would be a no-op that still

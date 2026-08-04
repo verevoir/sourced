@@ -215,3 +215,216 @@ describe('SourceProxy — distinct (source, sha) keys prime independently', () =
     expect(calls.map((c) => c.sha)).toEqual(['sha1', 'sha2']);
   });
 });
+
+// ---------------------------------------------------------------------------
+// LRU eviction and maxCachedBytes
+// ---------------------------------------------------------------------------
+
+describe('SourceProxy — LRU eviction and maxCachedBytes', () => {
+  // Build a tarball whose content is exactly `size` bytes (approximately —
+  // path overhead is small and consistent, so `size` is the dominant cost).
+  function makeTarball(id: string, payloadBytes: number): () => Buffer {
+    return () =>
+      buildFakeTarballGz([
+        { path: `file-${id}.txt`, content: 'x'.repeat(payloadBytes) },
+      ]);
+  }
+
+  it('under the budget, nothing is evicted: a re-read of a primed snapshot does not re-fetch', async () => {
+    // If a snapshot within the budget were evicted, the cache would be
+    // pointless — every re-read would cost an upstream fetch regardless of how
+    // much budget was left.
+    let fetchCount = 0;
+    const fetcher: TarballFetcher = {
+      async fetchTarball(source, sha) {
+        fetchCount++;
+        return buildFakeTarballGz([{ path: 'a.txt', content: 'hello' }]);
+      },
+    };
+    const proxy = new SourceProxy(fetcher, { maxCachedBytes: 10 * 1024 * 1024 });
+
+    await proxy.getBlob('org/repo', 'sha1', 'a.txt');
+    await proxy.getBlob('org/repo', 'sha2', 'a.txt');
+    expect(fetchCount).toBe(2);
+
+    // Re-read sha1 — should serve from cache.
+    await proxy.getBlob('org/repo', 'sha1', 'a.txt');
+    expect(fetchCount).toBe(2); // no additional fetch
+  });
+
+  it('over the budget, the LEAST RECENTLY USED snapshot is evicted', async () => {
+    // Eviction must target the coldest entry. If MRU were evicted instead, the
+    // snapshot most recently accessed would be the first to be lost, defeating
+    // temporal locality — the pattern that makes an LRU cache useful.
+    //
+    // Sequence: prime A, prime B, touch A (makes B the coldest), prime C
+    // (pushes past budget) → B must be evicted, A must remain.
+    // Verified by isPrimed() — no fetches needed after the eviction check.
+
+    const PAYLOAD = 50;
+    const fetcher: TarballFetcher = {
+      async fetchTarball(_source, sha) {
+        return makeTarball(sha, PAYLOAD)();
+      },
+    };
+
+    // Measure one entry's byte footprint, then set a budget that holds exactly 2.
+    const probe = new SourceProxy(
+      { async fetchTarball(_s, sha) { return makeTarball(sha, PAYLOAD)(); } },
+      { maxCachedBytes: 100 * 1024 * 1024 }
+    );
+    await probe.getBlob('org/repo', 'shaRef', `file-shaRef.txt`);
+    const oneEntryBytes = probe.cachedByteCount;
+
+    // Budget fits exactly 2 entries — admitting a third must evict the coldest.
+    const proxy = new SourceProxy(fetcher, { maxCachedBytes: oneEntryBytes * 2 + 1 });
+
+    await proxy.getBlob('org/repo', 'shaA', `file-shaA.txt`); // LRU order: [A]
+    await proxy.getBlob('org/repo', 'shaB', `file-shaB.txt`); // LRU order: [A, B]
+    await proxy.getBlob('org/repo', 'shaA', `file-shaA.txt`); // touch A → [B, A]
+
+    // Both entries fit; nothing evicted yet.
+    expect(proxy.isPrimed('org/repo', 'shaA')).toBe(true);
+    expect(proxy.isPrimed('org/repo', 'shaB')).toBe(true);
+
+    // Prime C: over budget → evict B (coldest), keep A (hot).
+    await proxy.getBlob('org/repo', 'shaC', `file-shaC.txt`); // LRU order: [A, C], B evicted
+
+    expect(proxy.isPrimed('org/repo', 'shaB')).toBe(false); // B was evicted
+    expect(proxy.isPrimed('org/repo', 'shaA')).toBe(true);  // A survived
+  });
+
+  it('a snapshot larger than the whole budget is still served to the caller that just primed it', async () => {
+    // If a too-large snapshot were immediately evicted after priming, every
+    // request for it would re-prime on every read — a cold-start loop with no
+    // exit.
+    let fetchCount = 0;
+    const fetcher: TarballFetcher = {
+      async fetchTarball(_source, _sha) {
+        fetchCount++;
+        return buildFakeTarballGz([{ path: 'big.txt', content: 'x'.repeat(10_000) }]);
+      },
+    };
+    // Budget is only 1 byte — far smaller than the snapshot.
+    const proxy = new SourceProxy(fetcher, { maxCachedBytes: 1 });
+
+    const content = await proxy.getBlob('org/repo', 'sha1', 'big.txt');
+    expect(fetchCount).toBe(1);
+    // The caller receives the bytes — the snapshot was not evicted before the read.
+    expect(content.byteLength).toBe(10_000);
+  });
+
+  it('cachedByteCount decreases after an eviction', async () => {
+    // If the byte counter is not decremented on eviction, the budget is only
+    // tracked upwards and the cache would continue evicting until it is empty,
+    // never stabilising.
+    const PAYLOAD = 100;
+    let fetchCount = 0;
+    const fetcher: TarballFetcher = {
+      async fetchTarball(_source, sha) {
+        fetchCount++;
+        return makeTarball(sha, PAYLOAD)();
+      },
+    };
+
+    const probe = new SourceProxy(
+      { async fetchTarball(_s, sha) { return makeTarball(sha, PAYLOAD)(); } },
+      { maxCachedBytes: 100 * 1024 * 1024 }
+    );
+    await probe.getBlob('org/repo', 'shaX', `file-shaX.txt`);
+    const oneEntryBytes = probe.cachedByteCount;
+
+    // Budget fits one entry only.
+    const proxy = new SourceProxy(fetcher, { maxCachedBytes: oneEntryBytes + 1 });
+    fetchCount = 0;
+
+    await proxy.getBlob('org/repo', 'sha1', `file-sha1.txt`);
+    const afterFirst = proxy.cachedByteCount;
+    expect(afterFirst).toBeGreaterThan(0);
+
+    // Prime a second entry; the first should be evicted.
+    await proxy.getBlob('org/repo', 'sha2', `file-sha2.txt`);
+    // The byte count must have dropped (eviction removed the first entry).
+    expect(proxy.cachedByteCount).toBeLessThan(afterFirst + oneEntryBytes);
+  });
+
+  it('an evicted snapshot re-primes and returns identical content', async () => {
+    // Eviction is a cache miss, not an error. The content stored upstream is
+    // immutable (addressed by sha), so a re-prime must return the same bytes.
+    const PAYLOAD = 50;
+    const fetcher: TarballFetcher = {
+      async fetchTarball(_source, sha) {
+        return makeTarball(sha, PAYLOAD)();
+      },
+    };
+
+    const probe = new SourceProxy(
+      { async fetchTarball(_s, sha) { return makeTarball(sha, PAYLOAD)(); } },
+      { maxCachedBytes: 100 * 1024 * 1024 }
+    );
+    await probe.getBlob('org/repo', 'shaEv', `file-shaEv.txt`);
+    const oneEntryBytes = probe.cachedByteCount;
+
+    // Budget fits exactly one entry.
+    const proxy = new SourceProxy(fetcher, { maxCachedBytes: oneEntryBytes + 1 });
+
+    const first = await proxy.getBlob('org/repo', 'shaEv', `file-shaEv.txt`);
+    // Prime a second entry to evict the first.
+    await proxy.getBlob('org/repo', 'shaOther', `file-shaOther.txt`);
+
+    // Re-prime and compare.
+    const second = await proxy.getBlob('org/repo', 'shaEv', `file-shaEv.txt`);
+    expect(second).toEqual(first);
+  });
+
+  it('isPrimed returns true for a resident snapshot and false for an evicted one', async () => {
+    // isPrimed is the signal the rate limiter uses to decide whether a request
+    // is expensive. An evicted entry that still reports true would cause cache
+    // hits to be mischarged as cache misses — or let a re-prime bypass the
+    // prime budget.
+    const PAYLOAD = 50;
+    const fetcher: TarballFetcher = {
+      async fetchTarball(_source, sha) {
+        return makeTarball(sha, PAYLOAD)();
+      },
+    };
+
+    const probe = new SourceProxy(
+      { async fetchTarball(_s, sha) { return makeTarball(sha, PAYLOAD)(); } },
+      { maxCachedBytes: 100 * 1024 * 1024 }
+    );
+    await probe.getBlob('org/repo', 'shaPr', `file-shaPr.txt`);
+    const oneEntryBytes = probe.cachedByteCount;
+
+    const proxy = new SourceProxy(fetcher, { maxCachedBytes: oneEntryBytes + 1 });
+
+    expect(proxy.isPrimed('org/repo', 'shaPr')).toBe(false); // never seen
+
+    await proxy.getBlob('org/repo', 'shaPr', `file-shaPr.txt`);
+    expect(proxy.isPrimed('org/repo', 'shaPr')).toBe(true); // resident
+
+    // Evict by priming another entry.
+    await proxy.getBlob('org/repo', 'shaEvict', `file-shaEvict.txt`);
+    expect(proxy.isPrimed('org/repo', 'shaPr')).toBe(false); // evicted
+  });
+
+  it('isPrimed never triggers a prime: asking does not increase the fetch count', async () => {
+    // If isPrimed caused a prime as a side effect, the rate limiter would be
+    // unable to classify a request accurately before spending its budget —
+    // and callers asking "is this primed?" would unexpectedly trigger fetches.
+    let fetchCount = 0;
+    const fetcher: TarballFetcher = {
+      async fetchTarball() {
+        fetchCount++;
+        return buildFakeTarballGz([{ path: 'a.txt', content: 'a' }]);
+      },
+    };
+    const proxy = new SourceProxy(fetcher);
+
+    proxy.isPrimed('org/repo', 'sha1');
+    proxy.isPrimed('org/repo', 'sha1');
+    proxy.isPrimed('org/repo', 'sha2');
+    expect(fetchCount).toBe(0);
+  });
+});
+

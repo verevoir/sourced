@@ -1,14 +1,14 @@
-// HTTP surface: `GET /v1/blob` and `GET /v1/tree`, per the design doc.
-// Deliberately thin — all the interesting behaviour is in `SourceProxy`;
-// this file only parses query params, calls the proxy, and maps its
-// results/errors onto HTTP status codes.
+// HTTP surface: `GET /v1/blob`, `GET /v1/tree` and `GET /healthz`.
+//
+// The retrieval logic lives in `SourceProxy`; what lives HERE is everything that
+// is only true at the request boundary — the trust decisions. Which sources this
+// service will lend its credential to, which paths it refuses outright, how much
+// volume one source may spend, and how a failure is rendered to a caller. None of
+// those belong in the proxy, because none of them are properties of retrieval.
 //
 // `handleRequest` is exported and tested directly against synthetic
-// `{method, url}` requests (see `tests/server.test.ts`) — no sockets, no
-// real HTTP round-trip needed to prove the routing and status-mapping are
-// correct. `createServer` is the thin `node:http` wrapper an operator
-// would actually run; it is exercised by nothing but its own type-check,
-// which is fine — sockets have nothing to do with S0's properties.
+// `{method, url}` requests (see `tests/server.test.ts`) — no sockets, no real HTTP
+// round-trip needed to prove routing, refusal and status-mapping are correct.
 
 import {
   createServer as createHttpServer,
@@ -17,6 +17,7 @@ import {
 } from 'node:http';
 import type { SourceProxy } from './proxy.js';
 import { ProxyNotFoundError } from './errors.js';
+import type { RateLimiter } from './rate-limit.js';
 
 export interface ProxyResponse {
   status: number;
@@ -41,6 +42,13 @@ export interface ServerOptions {
    * different words — "/v1/blob for one hardcoded corpus repo".
    */
   allowedSources?: ReadonlySet<string>;
+  /**
+   * Volume control. Optional because the library is usable without it and the
+   * tests are clearer for being able to leave it out — but the composition root
+   * always supplies one, and a deployment without it has no application-layer
+   * backstop at all. See `rate-limit.ts` for what it does and does not cover.
+   */
+  rateLimiter?: RateLimiter;
 }
 
 /** What `/healthz` reports: up, which build, and which store is wired in.
@@ -55,10 +63,14 @@ export interface ServiceInfo {
   store: 'memory' | 'filesystem' | 'gcs';
 }
 
-function jsonResponse(status: number, body: unknown): ProxyResponse {
+function jsonResponse(
+  status: number,
+  body: unknown,
+  headers: Record<string, string> = {}
+): ProxyResponse {
   return {
     status,
-    headers: { 'content-type': 'application/json' },
+    headers: { 'content-type': 'application/json', ...headers },
     body: JSON.stringify(body),
   };
 }
@@ -115,6 +127,39 @@ function denySource(
  * meant to remove. Rejection has no such failure mode, and a caller has no
  * legitimate reason to ask for a path outside the tree it just listed.
  */
+/**
+ * Charge a request against its source's budget, and refuse it if that budget is
+ * spent — with a `Retry-After` the caller can act on, rather than a bare error
+ * that invites an immediate retry.
+ *
+ * `expensive` is asked of the proxy rather than assumed, so the price matches
+ * what the request will actually cost: a resident snapshot is a map lookup, a
+ * cold one is a whole repository fetched and held.
+ *
+ * Called AFTER `denySource` on purpose. A refused source costs a Set lookup, so
+ * it needs no throttle — and keying a bucket by an arbitrary caller-supplied
+ * string would hand an attacker an unbounded map, which is the exhaustion this
+ * is here to prevent.
+ */
+function denyVolume(
+  limiter: RateLimiter | undefined,
+  source: string,
+  expensive: boolean
+): ProxyResponse | null {
+  if (!limiter) return null;
+  const verdict = limiter.check(source, expensive);
+  if (verdict.allowed) return null;
+  return jsonResponse(
+    429,
+    {
+      error: 'rate_limited',
+      message: `too many ${verdict.limit === 'primes' ? 'uncached snapshot requests' : 'requests'} for this source`,
+      retryAfterSeconds: verdict.retryAfterSeconds,
+    },
+    { 'retry-after': String(verdict.retryAfterSeconds) }
+  );
+}
+
 function denyPath(path: string): ProxyResponse | null {
   const normalised = path.replace(/\\/g, '/');
   const traversal = normalised.split('/').some((seg) => seg === '..');
@@ -138,7 +183,7 @@ export async function handleRequest(
   url: string,
   opts: ServerOptions = {}
 ): Promise<ProxyResponse> {
-  const { info, allowedSources } = opts;
+  const { info, allowedSources, rateLimiter } = opts;
   if (method !== 'GET') {
     return jsonResponse(405, { error: 'method_not_allowed' });
   }
@@ -182,6 +227,12 @@ export async function handleRequest(
     if (denied) return denied;
     const badPath = denyPath(params.path);
     if (badPath) return badPath;
+    const throttled = denyVolume(
+      rateLimiter,
+      params.source,
+      !proxy.isPrimed(params.source, params.sha)
+    );
+    if (throttled) return throttled;
     try {
       const content = await proxy.getBlob(params.source, params.sha, params.path);
       return {
@@ -204,6 +255,12 @@ export async function handleRequest(
     }
     const denied = denySource(params.source, allowedSources);
     if (denied) return denied;
+    const throttled = denyVolume(
+      rateLimiter,
+      params.source,
+      !proxy.isPrimed(params.source, params.sha)
+    );
+    if (throttled) return throttled;
     try {
       const entries = await proxy.getTree(params.source, params.sha);
       return jsonResponse(200, { entries });
@@ -218,9 +275,10 @@ export async function handleRequest(
   });
 }
 
-/** Thin `node:http` wrapper around `handleRequest` — what an operator
- * actually runs. Not exercised by the test suite (see module doc); the
- * behaviour it depends on is fully covered via `handleRequest` directly. */
+/** The `node:http` wrapper around `handleRequest` — what an operator actually
+ * runs. It adds one behaviour of its own, the catch-all below, which is covered
+ * by `tests/server.test.ts` driving a real socket; everything else it does is
+ * `handleRequest`, tested directly. */
 export function createServer(proxy: SourceProxy, opts: ServerOptions = {}) {
   return createHttpServer(async (req: IncomingMessage, res: ServerResponse) => {
     // A throw here would take down the whole process via node:http's

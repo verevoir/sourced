@@ -36,6 +36,20 @@ export interface TarballFetcher {
 interface PrimedEntry {
   files: Map<string, Buffer>;
   tree: TreeEntry[];
+  /** Bytes this entry holds, computed once at prime. The eviction budget is
+   * measured in the resource that actually runs out — heap — rather than in a
+   * snapshot count, because snapshots differ in size by orders of magnitude. */
+  bytes: number;
+}
+
+function entryBytes(files: Map<string, Buffer>): number {
+  let total = 0;
+  for (const [path, content] of files) {
+    // The key is retained alongside the value, so it is part of what the entry
+    // costs; 2 bytes/char is V8's worst case for a JS string.
+    total += content.byteLength + path.length * 2;
+  }
+  return total;
 }
 
 export interface SourceProxyOptions {
@@ -50,9 +64,35 @@ export interface SourceProxyOptions {
    * the store before going upstream; a successful prime writes through to
    * the store. When absent the proxy behaves identically to S0. */
   store?: BlobStore;
+  /** Heap budget for primed snapshots. Once exceeded, least-recently-used
+   * snapshots are evicted until the total fits again. Default 128 MiB — see
+   * `DEFAULT_MAX_CACHED_BYTES`. */
+  maxCachedBytes?: number;
 }
 
 const DEFAULT_NEGATIVE_TTL_MS = 60_000;
+
+/**
+ * How much heap primed snapshots may hold before eviction starts.
+ *
+ * This cache used to be unbounded and process-lifetime — "present forever within
+ * this process". Every distinct `(source, sha)` holds an entire repository in
+ * memory, so a caller naming N shas of an allowed source could grow it without
+ * limit until the instance OOMs. On Cloud Run that is a crash loop, not a slow
+ * degradation: eviction is what turns a memory-exhaustion vector into a cache
+ * miss.
+ *
+ * 128 MiB sits comfortably inside the 512 MiB default instance while still
+ * holding several corpus-sized snapshots, which is the working set that matters
+ * — a lens fan reading the same snapshot repeatedly. Raise it with the instance
+ * size via SOURCED_MAX_CACHED_BYTES.
+ */
+const DEFAULT_MAX_CACHED_BYTES = 128 * 1024 * 1024;
+
+/** Cap on remembered 404s. Bounded by TTL only in principle — an entry is
+ * removed when it is next asked for, so a caller naming many bad shas would
+ * otherwise grow this map for free. Small, because it holds only a timestamp. */
+const MAX_NEGATIVE_ENTRIES = 10_000;
 
 function sourceKey(source: string, sha: string): string {
   return `${source}\u0000${sha}`;
@@ -75,10 +115,20 @@ export class SourceProxy {
   private readonly negativeTtlMs: number;
   private readonly now: () => number;
   private readonly store?: BlobStore;
+  private readonly maxCachedBytes: number;
 
-  /** Successfully primed snapshots. Present forever within this process;
-   * eviction across processes is handled by the persistent store's GC. */
+  /** Successfully primed snapshots, in least-recently-used order — Map iterates
+   * in insertion order, so `touch()` re-inserting on every hit makes the FIRST
+   * key the coldest and eviction a walk from the front.
+   *
+   * Bounded by `maxCachedBytes`. Eviction here is a pure cache miss: the
+   * snapshot is still in the persistent store (and upstream), so an evicted key
+   * costs one re-read, never correctness. */
   private readonly primed = new Map<string, PrimedEntry>();
+
+  /** Bytes currently held across `primed`, maintained incrementally so the
+   * budget check is O(1) rather than a walk of every cached snapshot. */
+  private cachedBytes = 0;
 
   /** In-flight primes, keyed identically to `primed`. This Map IS the
    * single-flight mechanism: every caller for the same key during a prime
@@ -98,6 +148,49 @@ export class SourceProxy {
     this.negativeTtlMs = options.negativeTtlMs ?? DEFAULT_NEGATIVE_TTL_MS;
     this.now = options.now ?? Date.now;
     this.store = options.store;
+    this.maxCachedBytes = options.maxCachedBytes ?? DEFAULT_MAX_CACHED_BYTES;
+  }
+
+  /**
+   * Whether `(source, sha)` can be served without an upstream fetch or a store
+   * read. The request boundary uses this to price a request before doing it: a
+   * hit is a map lookup and needs no throttling, a miss can cost a whole tarball
+   * and does. Read-only — asking never primes anything.
+   */
+  isPrimed(source: string, sha: string): boolean {
+    return this.primed.has(sourceKey(source, sha));
+  }
+
+  /** Bytes currently held in the in-memory snapshot cache. Exposed for the
+   * health/metrics surface and for tests to assert the budget is honoured. */
+  get cachedByteCount(): number {
+    return this.cachedBytes;
+  }
+
+  /** Record a snapshot as most-recently-used, then evict from the cold end
+   * until the cache is back inside its budget. */
+  private admit(key: string, entry: PrimedEntry): void {
+    const existing = this.primed.get(key);
+    if (existing) this.cachedBytes -= existing.bytes;
+    this.primed.delete(key);
+    this.primed.set(key, entry);
+    this.cachedBytes += entry.bytes;
+
+    for (const [oldest, victim] of this.primed) {
+      if (this.cachedBytes <= this.maxCachedBytes) break;
+      // Never evict the entry we just admitted: the caller is about to read it,
+      // and dropping it would turn every request into a re-prime once a single
+      // snapshot exceeds the budget on its own.
+      if (oldest === key) continue;
+      this.primed.delete(oldest);
+      this.cachedBytes -= victim.bytes;
+    }
+  }
+
+  /** Move an existing key to the hot end of the LRU order. */
+  private touch(key: string, entry: PrimedEntry): void {
+    this.primed.delete(key);
+    this.primed.set(key, entry);
   }
 
   /** Prime (or reuse the prime of) a `(source, sha)` snapshot. The whole
@@ -109,7 +202,10 @@ export class SourceProxy {
     // 1. Already fully primed in memory — the fast path every request after
     // the first takes. Zero upstream cost, zero store cost.
     const done = this.primed.get(key);
-    if (done) return done;
+    if (done) {
+      this.touch(key, done);
+      return done;
+    }
 
     // 2. A definitive 404 for this exact (source, sha), still within TTL.
     // Fail fast without touching the fetcher or the in-flight map.
@@ -153,7 +249,7 @@ export class SourceProxy {
     if (this.store) {
       const fromStore = await this.loadFromStore(source, sha);
       if (fromStore) {
-        this.primed.set(key, fromStore);
+        this.admit(key, fromStore);
         return fromStore;
       }
     }
@@ -162,11 +258,13 @@ export class SourceProxy {
     try {
       const bytes = await this.fetcher.fetchTarball(source, sha);
       const files = extractTarball(bytes);
+      const fileMap = new Map(files.map((f) => [f.path, f.content]));
       const entry: PrimedEntry = {
-        files: new Map(files.map((f) => [f.path, f.content])),
+        files: fileMap,
         tree: buildTree(files),
+        bytes: entryBytes(fileMap),
       };
-      this.primed.set(key, entry);
+      this.admit(key, entry);
 
       // Write through to the persistent store asynchronously — we don't
       // block the caller on store writes. A failed write-through is logged
@@ -188,6 +286,12 @@ export class SourceProxy {
       // so the very next call gets a fresh attempt — "an upstream failure
       // does not poison the cache".
       if (err instanceof ProxyNotFoundError) {
+        // Oldest-first eviction, same Map-ordering trick as `primed`. Forgetting
+        // a 404 early costs one wasted upstream call, never a wrong answer.
+        if (this.negativeTarball.size >= MAX_NEGATIVE_ENTRIES) {
+          const oldest = this.negativeTarball.keys().next();
+          if (!oldest.done) this.negativeTarball.delete(oldest.value);
+        }
         this.negativeTarball.set(key, this.now() + this.negativeTtlMs);
       }
       throw err;
@@ -213,7 +317,7 @@ export class SourceProxy {
       files.set(entry.path, content);
     }
 
-    return { files, tree: manifest.entries };
+    return { files, tree: manifest.entries, bytes: entryBytes(files) };
   }
 
   /** Write all blobs and the tree manifest to the persistent store.

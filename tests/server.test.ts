@@ -1,6 +1,8 @@
 import { describe, it, expect } from 'vitest';
+import http from 'node:http';
 import { SourceProxy, type TarballFetcher } from '../src/proxy.js';
-import { handleRequest } from '../src/server.js';
+import { handleRequest, createServer } from '../src/server.js';
+import { RateLimiter } from '../src/rate-limit.js';
 import { buildFakeTarballGz } from './helpers/tarball.js';
 
 // The allowlist is fail-closed, so every route test must state which sources it
@@ -253,3 +255,165 @@ describe('handleRequest — /healthz', () => {
     expect((await handleRequest(makeProxy(), 'POST', '/healthz')).status).toBe(405);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Rate-limiter integration
+// ---------------------------------------------------------------------------
+
+/** A limiter whose prime budget is very small so tests can exhaust it with
+ * one or two requests, but whose request budget is generous enough that
+ * plain (non-prime) requests continue to work. */
+function makeTightPrimeLimiter(opts?: { now?: () => number }) {
+  return new RateLimiter({
+    requestBurst: 200,
+    requestsPerSecond: 50,
+    primeBurst: 1,    // one prime allowed then refused
+    primesPerSecond: 0.001,
+    now: opts?.now ?? (() => 0),
+  });
+}
+
+describe('handleRequest — rate limiting', () => {
+  it('an over-limit request gets 429 with a positive-integer retry-after header', async () => {
+    // A 429 with no Retry-After header invites an immediate retry, which is the
+    // exact behaviour the rate limit exists to stop. The header value must be a
+    // positive integer so a client can safely back off for that many seconds.
+    const limiter = makeTightPrimeLimiter();
+    const proxy = makeProxy();
+    const OPTS = { allowedSources: new Set(['org/repo']), rateLimiter: limiter };
+
+    // Exhaust the prime budget.
+    await handleRequest(proxy, 'GET', '/v1/tree?source=org%2Frepo&sha=sha1', OPTS);
+
+    // This request should be throttled.
+    const res = await handleRequest(proxy, 'GET', '/v1/tree?source=org%2Frepo&sha=sha2', OPTS);
+    expect(res.status).toBe(429);
+
+    const retryAfter = res.headers['retry-after'];
+    expect(retryAfter).toBeDefined();
+    const parsed = parseInt(String(retryAfter), 10);
+    expect(Number.isInteger(parsed)).toBe(true);
+    expect(parsed).toBeGreaterThan(0);
+  });
+
+  it('reads of an already-primed snapshot are NOT charged the prime budget', async () => {
+    // Cache hits are cheap (map lookup only). The whole point of the two-budget
+    // design is that a warm snapshot's reads must survive even when the prime
+    // budget is exhausted.
+    const fetcher: TarballFetcher = {
+      async fetchTarball() {
+        return buildFakeTarballGz([{ path: 'a.txt', content: 'hello' }]);
+      },
+    };
+    const proxy = new SourceProxy(fetcher);
+    const limiter = makeTightPrimeLimiter();
+    const OPTS = { allowedSources: new Set(['org/repo']), rateLimiter: limiter };
+
+    // Prime sha1 — uses the one prime token.
+    await handleRequest(proxy, 'GET', '/v1/tree?source=org%2Frepo&sha=sha1', OPTS);
+
+    // Exhaust the prime budget with a different sha.
+    // (sha1 is already primed, so a second call for sha1 is cheap;
+    // but sha2 is cold and will be refused because the budget is now empty.)
+    const throttled = await handleRequest(
+      proxy, 'GET', '/v1/tree?source=org%2Frepo&sha=sha2', OPTS
+    );
+    expect(throttled.status).toBe(429);
+
+    // Reads of the already-primed sha1 must still succeed — they are cheap.
+    const res = await handleRequest(
+      proxy, 'GET', '/v1/blob?source=org%2Frepo&sha=sha1&path=a.txt', OPTS
+    );
+    expect(res.status).toBe(200);
+  });
+
+  it('a denied source does not consume any rate-limit budget', async () => {
+    // denySource fires before denyVolume on purpose. If a denied source keyed
+    // a bucket in the limiter, an attacker could exhaust a valid source's
+    // budget by hammering a denied name — the caller-supplied string would be
+    // an unbounded map key. Verify by spending nothing on a denied source and
+    // confirming the allowed source still has its full budget.
+    const limiter = makeTightPrimeLimiter();
+    const ALLOWED = new Set(['org/repo']);
+    const OPTS = { allowedSources: ALLOWED, rateLimiter: limiter };
+
+    // Hit a denied source many times — must not consume budget.
+    for (let i = 0; i < 20; i++) {
+      const res = await handleRequest(
+        makeProxy(), 'GET', `/v1/tree?source=evil%2Frepo&sha=sha${i}`, OPTS
+      );
+      expect(res.status).toBe(403);
+    }
+
+    // The allowed source must still have its full prime budget intact.
+    const res = await handleRequest(
+      makeProxy(), 'GET', '/v1/tree?source=org%2Frepo&sha=sha1', OPTS
+    );
+    expect(res.status).toBe(200);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// createServer — real socket tests
+// ---------------------------------------------------------------------------
+
+describe('createServer — maps a throw to 500 rather than crashing the process', () => {
+  it('returns 500 with a JSON body when the proxy throws outside the route try/catch', async () => {
+    // WHY THIS EXISTS: an unhandled throw in the request handler reaches
+    // node:http's 'uncaughtException' path and takes the whole PROCESS down — one
+    // bad request becoming an outage. `createServer`'s catch-all is the only
+    // thing standing between those two outcomes, and it is the one behaviour
+    // `createServer` adds over `handleRequest`, so it needs a real socket to
+    // prove rather than a synthetic call.
+    //
+    // The injection point is deliberate. `handleRequest` already wraps the
+    // retrieval calls and maps their failures to 404/502, so a throwing fetcher
+    // proves nothing about this boundary. `isPrimed` is called to PRICE the
+    // request before that try/catch opens, which makes it the honest place to
+    // inject a fault that escapes — standing in for any future statement added
+    // outside the guard.
+    const bustedProxy = {
+      isPrimed() {
+        throw new Error('classification exploded');
+      },
+      async getTree() {
+        return [];
+      },
+      async getBlob() {
+        return Buffer.alloc(0);
+      },
+    } as unknown as SourceProxy;
+
+    const server = createServer(bustedProxy, {
+      allowedSources: new Set(['org/repo']),
+    });
+
+    await new Promise<void>((resolve) => server.listen(0, resolve));
+    const port = (server.address() as { port: number }).port;
+
+    let res: http.IncomingMessage;
+    let body = '';
+    try {
+      res = await new Promise<http.IncomingMessage>((resolve, reject) => {
+        const req = http.get(
+          `http://127.0.0.1:${port}/v1/tree?source=org%2Frepo&sha=sha1`,
+          resolve
+        );
+        req.on('error', reject);
+      });
+      body = await new Promise<string>((resolve) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (c: Buffer) => chunks.push(c));
+        res.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+      });
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+
+    expect(res!.statusCode).toBe(500);
+    const parsed = JSON.parse(body);
+    expect(parsed).toMatchObject({ error: 'internal_error' });
+    expect(typeof parsed.message).toBe('string');
+  });
+});
+
