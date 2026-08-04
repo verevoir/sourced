@@ -523,3 +523,113 @@ describe('blobKey — refuses an escaping path instead of sanitising it', () => 
     expect(blobKey('org/repo', 'sha1', 'src/index.ts')).toMatch(/\/blobs\/src\/index\.ts$/);
   });
 });
+
+// ---------------------------------------------------------------------------
+// GC over a bucket that answers the way REAL GCS answers
+// ---------------------------------------------------------------------------
+
+describe('runGc over GcsBlobStore — GCS returns prefixes WITH their delimiter', () => {
+  // Why this exists: `makeFakeGcsBucket` above returns `snapshots/<hash>`, but
+  // real GCS returns a common prefix as `snapshots/<hash>/` — with the
+  // delimiter. `runGc` appends `/_tree.json` to whatever it is given, so the
+  // real shape produced `snapshots/<hash>//_tree.json`, which matches no stored
+  // object. A missing manifest means KEEP, so GC read every snapshot as
+  // unevaluable and deleted nothing — silently, for as long as it has existed,
+  // while looking entirely healthy.
+  //
+  // The fake being kinder than the real thing is what hid it. This one is not.
+
+  function makeGcsFaithfulBucket(): GcsBucket & { objects: Map<string, Buffer> } {
+    const objects = new Map<string, Buffer>();
+    return {
+      objects,
+      async download(key) {
+        return objects.get(key) ?? null;
+      },
+      async upload(key, content) {
+        objects.set(key, content);
+      },
+      async listSnapshotPrefixes() {
+        const prefixes = new Set<string>();
+        for (const key of objects.keys()) {
+          const match = /^(snapshots\/[^/]+\/)/.exec(key); // note: keeps the slash
+          if (match) prefixes.add(match[1]!);
+        }
+        return [...prefixes];
+      },
+      async deletePrefix(prefix) {
+        for (const key of [...objects.keys()]) {
+          if (key.startsWith(prefix)) objects.delete(key);
+        }
+      },
+    };
+  }
+
+  it('actually deletes an expired snapshot', async () => {
+    const bucket = makeGcsFaithfulBucket();
+    const store = new GcsBlobStore(bucket);
+    const now = Date.parse('2026-01-01T00:00:00Z');
+
+    await store.putBlob('org/repo', 'sha1', 'a.txt', Buffer.from('A'));
+    await store.putTreeManifest('org/repo', 'sha1', {
+      sourceUrl: 'org/repo',
+      sha: 'sha1',
+      createdAt: new Date(now - 60 * 60_000).toISOString(), // an hour old
+      entries: [{ path: 'a.txt', type: 'blob', sha: 'blobsha' }],
+    });
+    expect(bucket.objects.size).toBeGreaterThan(0);
+
+    const deleted = await runGc(store, new MaxAgePolicyMs(30 * 60_000, () => now));
+
+    expect(deleted).toBe(1);
+    expect(bucket.objects.size).toBe(0);
+  });
+
+  it('keeps a snapshot that is still within its TTL', async () => {
+    // The other direction matters just as much: a GC that deletes a live
+    // snapshot costs an upstream re-prime for every caller still naming its sha.
+    const bucket = makeGcsFaithfulBucket();
+    const store = new GcsBlobStore(bucket);
+    const now = Date.parse('2026-01-01T00:00:00Z');
+
+    await store.putBlob('org/repo', 'sha1', 'a.txt', Buffer.from('A'));
+    await store.putTreeManifest('org/repo', 'sha1', {
+      sourceUrl: 'org/repo',
+      sha: 'sha1',
+      createdAt: new Date(now - 60_000).toISOString(), // a minute old
+      entries: [{ path: 'a.txt', type: 'blob', sha: 'blobsha' }],
+    });
+
+    const deleted = await runGc(store, new MaxAgePolicyMs(30 * 60_000, () => now));
+
+    expect(deleted).toBe(0);
+    expect(bucket.objects.size).toBe(2);
+  });
+
+  it('deleting one snapshot leaves another untouched', async () => {
+    // deleteSnapshot uses a prefix, and a prefix delete that reached a sibling
+    // would destroy live data — the one failure mode here that is not recoverable
+    // by re-priming a single key.
+    const bucket = makeGcsFaithfulBucket();
+    const store = new GcsBlobStore(bucket);
+    const now = Date.parse('2026-01-01T00:00:00Z');
+
+    for (const [sha, ageMs] of [
+      ['old', 60 * 60_000],
+      ['new', 60_000],
+    ] as const) {
+      await store.putBlob('org/repo', sha, 'a.txt', Buffer.from(sha));
+      await store.putTreeManifest('org/repo', sha, {
+        sourceUrl: 'org/repo',
+        sha,
+        createdAt: new Date(now - ageMs).toISOString(),
+        entries: [{ path: 'a.txt', type: 'blob', sha: 'blobsha' }],
+      });
+    }
+
+    await runGc(store, new MaxAgePolicyMs(30 * 60_000, () => now));
+
+    expect(await store.getBlob('org/repo', 'new', 'a.txt')).toEqual(Buffer.from('new'));
+    expect(await store.getBlob('org/repo', 'old', 'a.txt')).toBeNull();
+  });
+});

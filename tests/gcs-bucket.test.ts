@@ -242,11 +242,15 @@ describe('GoogleCloudBucket — listSnapshotPrefixes', () => {
       storage: makeFakeStorage(() => makePagedBucket(queries)),
     });
     const prefixes = await bucket.listSnapshotPrefixes();
+    // Returned WITHOUT the trailing delimiter GCS puts on a common prefix: runGc
+    // appends '/_tree.json' to these, and the extra slash produced a key that
+    // matched no object — GC then read every manifest as missing, which means
+    // KEEP, so it silently collected nothing.
     expect(prefixes).toEqual(expect.arrayContaining([
-      'snapshots/aaa/',
-      'snapshots/bbb/',
-      'snapshots/ccc/',
-      'snapshots/ddd/',
+      'snapshots/aaa',
+      'snapshots/bbb',
+      'snapshots/ccc',
+      'snapshots/ddd',
     ]));
     expect(prefixes).toHaveLength(4);
   });
@@ -294,7 +298,7 @@ describe('GoogleCloudBucket — listSnapshotPrefixes', () => {
       storage: makeFakeStorage(() => dupBucket),
     });
     const prefixes = await bucket.listSnapshotPrefixes();
-    const dupCount = prefixes.filter((p) => p === 'snapshots/dup/').length;
+    const dupCount = prefixes.filter((p) => p === 'snapshots/dup').length;
     expect(dupCount).toBe(1);
   });
 

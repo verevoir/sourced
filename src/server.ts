@@ -1,4 +1,6 @@
-// HTTP surface: `GET /v1/blob`, `GET /v1/tree` and `GET /healthz`.
+// HTTP surface: `GET /v1/blob`, `GET /v1/tree`, and `GET /healthz` (aliased as
+// `/health`, because the probe path is the platform's choice and one image runs
+// on all of them).
 //
 // The retrieval logic lives in `SourceProxy`; what lives HERE is everything that
 // is only true at the request boundary — the trust decisions. Which sources this
@@ -15,6 +17,7 @@ import {
   type IncomingMessage,
   type ServerResponse,
 } from 'node:http';
+import { randomUUID } from 'node:crypto';
 import type { SourceProxy } from './proxy.js';
 import { ProxyNotFoundError } from './errors.js';
 import type { RateLimiter } from './rate-limit.js';
@@ -51,9 +54,9 @@ export interface ServerOptions {
   rateLimiter?: RateLimiter;
 }
 
-/** What `/healthz` reports: up, which build, and which store is wired in.
- * Supplied by the composition root, because the server itself has no way to
- * know any of it. */
+/** What `/healthz` (and its `/health` alias) reports: up, which build, and which
+ * store is wired in. Supplied by the composition root, because the server itself
+ * has no way to know any of it. */
 export interface ServiceInfo {
   /** Package version of the running build. */
   version: string;
@@ -289,9 +292,29 @@ export function createServer(proxy: SourceProxy, opts: ServerOptions = {}) {
       res.writeHead(response.status, response.headers);
       res.end(response.body);
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      // The detail goes to the OPERATOR, never the caller. A raw error message
+      // here carries bucket names, filesystem paths and SDK internals — a free
+      // map of the service to anyone who can provoke a crash — and none of it
+      // helps the caller, because a 500 is our bug and not something they can
+      // act on. They get a reference; we log the same reference beside the
+      // cause, so an operator can still join the two.
+      //
+      // The 502 path in `errorResponse` deliberately does still relay its
+      // message: that one describes the caller's OWN request failing against a
+      // source they are allowlisted for, which is information they can use.
+      const reference = randomUUID();
+      console.error(
+        `internal_error ${reference} on ${req.method ?? 'GET'} ${req.url ?? '/'}:`,
+        err
+      );
       res.writeHead(500, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ error: 'internal_error', message }));
+      res.end(
+        JSON.stringify({
+          error: 'internal_error',
+          message: 'the service failed to handle this request',
+          reference,
+        })
+      );
     }
   });
 }

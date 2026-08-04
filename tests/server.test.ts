@@ -419,7 +419,17 @@ describe('createServer — maps a throw to 500 rather than crashing the process'
     expect(res!.statusCode).toBe(500);
     const parsed = JSON.parse(body);
     expect(parsed).toMatchObject({ error: 'internal_error' });
-    expect(typeof parsed.message).toBe('string');
+
+    // The body must NOT carry the underlying error. A raw message here hands a
+    // caller bucket names, filesystem paths and SDK internals — a free map of
+    // the service to anyone able to provoke a crash — and tells them nothing
+    // they can act on, because a 500 is our bug and not their request's fault.
+    expect(body).not.toMatch(/classification exploded/);
+
+    // But an operator still has to be able to join this response to the log line
+    // that does carry the cause, so it carries a reference.
+    expect(typeof parsed.reference).toBe('string');
+    expect(parsed.reference.length).toBeGreaterThan(0);
   });
 });
 

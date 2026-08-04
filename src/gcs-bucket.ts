@@ -109,7 +109,15 @@ export class GoogleCloudBucket implements GcsBucket {
         this.bucket.getFiles(query)
       );
       for (const p of (apiResponse as { prefixes?: string[] } | undefined)?.prefixes ?? []) {
-        prefixes.add(p);
+        // GCS returns a common prefix WITH its delimiter: `snapshots/<hash>/`.
+        // The filesystem adapter returns `snapshots/<hash>`, and `runGc` appends
+        // `/_tree.json` to whatever it gets — so leaving the slash on produced
+        // `snapshots/<hash>//_tree.json`, which matches no stored object. GC then
+        // read every snapshot's manifest as missing, and a missing manifest means
+        // KEEP: garbage collection silently did nothing at all on GCS, for as long
+        // as it has existed, while looking perfectly healthy. Both adapters
+        // implement one port and have to answer in one shape.
+        prefixes.add(p.replace(/\/+$/, ''));
       }
       if (!nextQuery) return [...prefixes];
       query = { ...(nextQuery as Record<string, unknown>), autoPaginate: false };

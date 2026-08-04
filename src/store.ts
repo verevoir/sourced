@@ -388,7 +388,13 @@ export interface GcsBucket {
   /** Upload a blob idempotently (last-writer-wins is fine — content is
    * identical for the same key). */
   upload(key: string, content: Buffer, contentType: string): Promise<void>;
-  /** List all "directories" (common prefixes) under `snapshots/`. */
+  /** List all "directories" (common prefixes) under `snapshots/`.
+   *
+   * CONTRACT: each entry is `snapshots/<id>` with NO trailing delimiter. GCS
+   * itself returns common prefixes WITH one, so an adapter over it must strip
+   * it — `runGc` appends `/_tree.json` to these, and the extra slash produced a
+   * key that matched no stored object. `GcsBlobStore` re-normalises anyway; see
+   * `listSnapshotKeys`. */
   listSnapshotPrefixes(): Promise<string[]>;
   /** Delete all objects whose key starts with `prefix`. */
   deletePrefix(prefix: string): Promise<void>;
@@ -434,11 +440,25 @@ export class GcsBlobStore implements RawBlobStore {
   }
 
   async listSnapshotKeys(): Promise<string[]> {
-    return this.bucket.listSnapshotPrefixes();
+    // Normalised HERE as well as in the adapter, and deliberately so. This is the
+    // boundary `runGc` actually depends on: it appends `/_tree.json` to every key
+    // it gets back, so a trailing delimiter yields `snapshots/<id>//_tree.json`,
+    // which matches nothing. A missing manifest means KEEP, so the failure is
+    // silent — GC reports success and deletes nothing, for as long as nobody
+    // checks the bucket. A guarantee whose breach is invisible is worth
+    // enforcing at the seam that relies on it, not only in the one adapter that
+    // happens to ship today.
+    const keys = await this.bucket.listSnapshotPrefixes();
+    return keys.map((key) => key.replace(/\/+$/, ''));
   }
 
   async deleteSnapshot(snapshotKeyPath: string): Promise<void> {
-    await this.bucket.deletePrefix(snapshotKeyPath);
+    // Trailing slash on purpose. `snapshots/<hash>` as a raw prefix would also
+    // match `snapshots/<hash>anything`; the delimiter confines the delete to
+    // that one snapshot's own objects. Today's keys are fixed-length hashes so
+    // no such sibling can exist — but a delete is the one operation where being
+    // right by accident is not good enough.
+    await this.bucket.deletePrefix(`${snapshotKeyPath.replace(/\/+$/, '')}/`);
   }
 
   async getRawManifest(rawKey: string): Promise<TreeManifest | null> {
