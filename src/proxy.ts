@@ -78,7 +78,7 @@ export interface SourceProxyOptions {
    * `DEFAULT_MAX_CACHED_BYTES`. */
   maxCachedBytes?: number;
   /** How many remembered 404s to hold before evicting the oldest. Default
-   * 10,000 — see `MAX_NEGATIVE_ENTRIES`. Injectable so the eviction can be
+   * 10,000 — see `DEFAULT_MAX_NEGATIVE_ENTRIES`. Injectable so the eviction can be
    * tested at a size a test can reach. */
   maxNegativeEntries?: number;
 }

@@ -19,11 +19,23 @@ import type { GcsBucket } from './store.js';
  */
 const DEFAULT_TIMEOUT_MS = 30_000;
 
-/** Pages to walk before giving up on a listing. Bounds GC's worst case: a
- * bucket with a pathological number of snapshots costs a bounded number of API
- * calls per sweep, and the next sweep picks up where cost cut this one short.
- * GC is allowed to keep too much (see `GcPolicy`), so stopping early is safe. */
+/** Pages to walk before giving up on a listing, and a wall-clock ceiling on the
+ * walk as a whole.
+ *
+ * Two bounds because they catch different failures: the page cap stops a
+ * pathological bucket costing unbounded API calls, and the time budget stops a
+ * merely SLOW bucket doing the same in wall-clock — a per-page deadline alone
+ * would allow MAX_LIST_PAGES × timeoutMs, which is most of an hour.
+ *
+ * Truncating is safe but NOT self-healing, and the difference matters: there is
+ * no cursor, so every sweep restarts from the beginning of the bucket rather
+ * than resuming where the last one stopped. A bucket that consistently exceeds
+ * either bound therefore has a tail that is never collected at all. That is
+ * still the right failure — GC is allowed to keep too much, never to delete
+ * something referenced (see `GcPolicy`) — but it is a signal to raise the bounds
+ * or shorten the TTL, which is why truncation is logged rather than silent. */
 const MAX_LIST_PAGES = 100;
+const DEFAULT_LIST_BUDGET_MS = 120_000;
 
 export interface GoogleCloudBucketOptions {
   /** Bucket name. */
@@ -32,6 +44,14 @@ export interface GoogleCloudBucketOptions {
   storage?: Storage;
   /** Ceiling on any one operation. See `DEFAULT_TIMEOUT_MS`. */
   timeoutMs?: number;
+  /** Ceiling on a whole paged listing, across all its pages. See
+   * `DEFAULT_LIST_BUDGET_MS`. */
+  listBudgetMs?: number;
+  /** Where a truncated listing is reported. Defaults to `console.warn` — a
+   * silently truncated sweep looks exactly like a complete one. */
+  onTruncated?: (message: string) => void;
+  /** Injectable clock, so the budget is testable without waiting. */
+  now?: () => number;
 }
 
 /**
@@ -50,9 +70,15 @@ export interface GoogleCloudBucketOptions {
 export class GoogleCloudBucket implements GcsBucket {
   private readonly bucket;
   private readonly timeoutMs: number;
+  private readonly listBudgetMs: number;
+  private readonly onTruncated: (message: string) => void;
+  private readonly now: () => number;
 
   constructor(opts: GoogleCloudBucketOptions) {
     this.timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    this.listBudgetMs = opts.listBudgetMs ?? DEFAULT_LIST_BUDGET_MS;
+    this.onTruncated = opts.onTruncated ?? ((m) => console.warn(m));
+    this.now = opts.now ?? Date.now;
     const storage =
       opts.storage ??
       new Storage({
@@ -97,6 +123,7 @@ export class GoogleCloudBucket implements GcsBucket {
     // stop collecting the rest. Walking the pages by hand is the only way to
     // accumulate prefixes correctly.
     const prefixes = new Set<string>();
+    const startedAt = this.now();
     let query: Record<string, unknown> = {
       prefix: 'snapshots/',
       delimiter: '/',
@@ -104,6 +131,15 @@ export class GoogleCloudBucket implements GcsBucket {
     };
 
     for (let page = 0; page < MAX_LIST_PAGES; page++) {
+      if (page > 0 && this.now() - startedAt >= this.listBudgetMs) {
+        this.onTruncated(
+          `gcs: snapshot listing hit its ${this.listBudgetMs}ms budget after ${page} page(s); ` +
+            `${prefixes.size} prefix(es) seen. GC will sweep only those — and will restart from ` +
+            `the beginning next time, so a persistently slow listing leaves a tail uncollected.`
+        );
+        return [...prefixes];
+      }
+
       const [, nextQuery, apiResponse] = await this.withDeadline(
         `list snapshots (page ${page + 1})`,
         this.bucket.getFiles(query)
@@ -123,6 +159,11 @@ export class GoogleCloudBucket implements GcsBucket {
       query = { ...(nextQuery as Record<string, unknown>), autoPaginate: false };
     }
 
+    this.onTruncated(
+      `gcs: snapshot listing stopped at the ${MAX_LIST_PAGES}-page cap with ${prefixes.size} ` +
+        `prefix(es) seen. There is no cursor, so the next sweep restarts from the beginning: ` +
+        `raise the cap or shorten the snapshot TTL, or the tail is never collected.`
+    );
     return [...prefixes];
   }
 

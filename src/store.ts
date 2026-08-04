@@ -193,6 +193,24 @@ export class MaxAgePolicyMs implements GcPolicy {
   }
 }
 
+export interface GcOptions {
+  /**
+   * Wall-clock ceiling for one whole sweep.
+   *
+   * A sweep costs one manifest read plus possibly a delete PER SNAPSHOT, each
+   * with its own timeout — so bounding the individual calls bounds nothing in
+   * aggregate: a thousand snapshots at thirty seconds each is hours. It runs on
+   * an interval, so a sweep that outlasts its own interval means sweeps overlap
+   * and pile up, each holding connections, until the instance is doing nothing
+   * else. The composition root sets this from the interval it schedules.
+   */
+  budgetMs?: number;
+  /** Injectable clock, so the budget is testable without waiting. */
+  now?: () => number;
+}
+
+const DEFAULT_GC_BUDGET_MS = 120_000;
+
 /**
  * Run one GC sweep: list all snapshots, evaluate each against the policy,
  * and delete those the policy marks as eligible.
@@ -201,16 +219,34 @@ export class MaxAgePolicyMs implements GcPolicy {
  *
  * A failure on one snapshot is logged and skipped rather than aborting the
  * sweep — partial GC success is safe (it leaves extra data, not missing
- * data).
+ * data). Running out of budget is the same kind of safe: the sweep stops early
+ * and says so. There is no cursor, so the next sweep starts from the beginning
+ * rather than resuming — which is why exhausting the budget is LOGGED and not
+ * treated as an ordinary finish. A sweep that never reaches the end leaves a
+ * tail that is never collected.
  */
 export async function runGc(
   store: BlobStore,
   policy: GcPolicy,
-  log: (msg: string) => void = () => {}
+  log: (msg: string) => void = () => {},
+  options: GcOptions = {}
 ): Promise<number> {
+  const budgetMs = options.budgetMs ?? DEFAULT_GC_BUDGET_MS;
+  const now = options.now ?? Date.now;
+  const startedAt = now();
+
   const keys = await store.listSnapshotKeys();
   let deleted = 0;
+  let examined = 0;
   for (const key of keys) {
+    if (now() - startedAt >= budgetMs) {
+      log(
+        `gc: stopped at its ${budgetMs}ms budget after examining ${examined}/${keys.length} ` +
+          `snapshot(s), ${deleted} deleted. The next sweep restarts from the beginning.`
+      );
+      return deleted;
+    }
+    examined++;
     // We need the manifest to evaluate the policy, but the snapshot key is
     // opaque (a hash). Read the manifest directly from the store using the
     // well-known path within the snapshot.

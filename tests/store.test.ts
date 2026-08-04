@@ -633,3 +633,98 @@ describe('runGc over GcsBlobStore — GCS returns prefixes WITH their delimiter'
     expect(await store.getBlob('org/repo', 'old', 'a.txt')).toBeNull();
   });
 });
+
+describe('runGc — a sweep is bounded in wall-clock, not just per call', () => {
+  // Per-operation timeouts bound nothing in aggregate: a sweep costs a manifest
+  // read plus possibly a delete PER SNAPSHOT, so a thousand snapshots at thirty
+  // seconds each is hours. GC runs on an interval, so a sweep that outlasts its
+  // own interval means sweeps overlap and pile up until the instance is doing
+  // nothing else.
+
+  /** A store with `count` snapshots, all old enough to delete, whose clock
+   * advances by `msPerSnapshot` on every manifest read. */
+  function makeSlowStore(count: number, msPerSnapshot: number, clock: { t: number }) {
+    const deletedKeys: string[] = [];
+    const store: RawBlobStore = {
+      async getBlob() {
+        return null;
+      },
+      async putBlob() {},
+      async getTreeManifest() {
+        return null;
+      },
+      async putTreeManifest() {},
+      async listSnapshotKeys() {
+        return Array.from({ length: count }, (_, i) => `snapshots/s${i}`);
+      },
+      async deleteSnapshot(key) {
+        deletedKeys.push(key);
+      },
+      async getRawManifest() {
+        clock.t += msPerSnapshot;
+        return {
+          sourceUrl: 'org/repo',
+          sha: 'sha',
+          createdAt: new Date(0).toISOString(), // ancient — always collectable
+          entries: [],
+        };
+      },
+    };
+    return { store, deletedKeys };
+  }
+
+  // Start the clock well past the epoch so the ancient manifests below are
+  // genuinely older than the policy's max age when measured against it.
+  const START = 10_000_000;
+
+  it('stops when the budget is spent rather than running to the end', async () => {
+    const clock = { t: START };
+    const { store, deletedKeys } = makeSlowStore(100, 10, clock);
+
+    const deleted = await runGc(store, new MaxAgePolicyMs(1_000, () => clock.t), () => {}, {
+      budgetMs: 50,
+      now: () => clock.t,
+    });
+
+    // 50ms of budget at 10ms a snapshot: a handful, not all hundred.
+    expect(deleted).toBeGreaterThan(0);
+    expect(deleted).toBeLessThan(100);
+    expect(deletedKeys).toHaveLength(deleted);
+  });
+
+  it('says so when it stops early, rather than reporting a clean finish', async () => {
+    // There is no cursor: the next sweep restarts from the beginning, so a sweep
+    // that never reaches the end leaves a tail that is NEVER collected. Silent
+    // truncation would read as "the bucket is tidy" while it quietly grows.
+    const clock = { t: START };
+    const { store } = makeSlowStore(100, 10, clock);
+    const logged: string[] = [];
+
+    await runGc(store, new MaxAgePolicyMs(1_000, () => clock.t), (m) => logged.push(m), {
+      budgetMs: 50,
+      now: () => clock.t,
+    });
+
+    expect(logged.some((m) => /budget/.test(m) && /restarts from the beginning/.test(m))).toBe(
+      true
+    );
+  });
+
+  it('completes normally and logs no truncation when the budget is ample', async () => {
+    // The bound must not fire on an ordinary sweep, or every healthy run would
+    // look like a degraded one.
+    const clock = { t: START };
+    const { store } = makeSlowStore(5, 1, clock);
+    const logged: string[] = [];
+
+    const deleted = await runGc(
+      store,
+      new MaxAgePolicyMs(1_000, () => clock.t),
+      (m) => logged.push(m),
+      { budgetMs: 60_000, now: () => clock.t }
+    );
+
+    expect(deleted).toBe(5);
+    expect(logged.some((m) => /budget/.test(m))).toBe(false);
+  });
+});

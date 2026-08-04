@@ -357,3 +357,122 @@ describe('GoogleCloudBucket — listSnapshotPrefixes', () => {
     await expect(bucket.listSnapshotPrefixes()).rejects.toThrow(/exceeded 20ms/);
   });
 });
+
+describe('GoogleCloudBucket — the page walk is bounded in wall-clock too', () => {
+  // A per-page deadline alone permits MAX_LIST_PAGES × timeoutMs, which is most
+  // of an hour. The page cap catches a pathological bucket; this catches a
+  // merely slow one.
+
+  /** A bucket whose pages never run out, advancing the clock on every call. */
+  function makeEndlessBucket(clock: { t: number }, msPerPage: number): FakeBucketObject {
+    let page = 0;
+    return {
+      file(_key) {
+        return {
+          async download(): Promise<[Buffer]> {
+            return [Buffer.alloc(0)];
+          },
+          async save() {},
+        };
+      },
+      async getFiles() {
+        clock.t += msPerPage;
+        page++;
+        return [[], { pageToken: `p${page}`, autoPaginate: false }, { prefixes: [`snapshots/p${page}/`] }];
+      },
+      async deleteFiles() {},
+    };
+  }
+
+  it('stops at the listing budget rather than walking every page', async () => {
+    const clock = { t: 0 };
+    const bucket = new GoogleCloudBucket({
+      bucket: 'test-bucket',
+      storage: makeFakeStorage(() => makeEndlessBucket(clock, 10)),
+      listBudgetMs: 50,
+      onTruncated: () => {},
+      now: () => clock.t,
+    });
+
+    const prefixes = await bucket.listSnapshotPrefixes();
+    // 50ms at 10ms a page — far short of the 100-page cap.
+    expect(prefixes.length).toBeGreaterThan(0);
+    expect(prefixes.length).toBeLessThan(20);
+  });
+
+  it('reports the truncation instead of returning a short list silently', async () => {
+    // A truncated listing looks exactly like a complete one, and GC keeps what
+    // it cannot see — so the bucket grows a tail nobody is told about.
+    const clock = { t: 0 };
+    const warnings: string[] = [];
+    const bucket = new GoogleCloudBucket({
+      bucket: 'test-bucket',
+      storage: makeFakeStorage(() => makeEndlessBucket(clock, 10)),
+      listBudgetMs: 50,
+      onTruncated: (m) => warnings.push(m),
+      now: () => clock.t,
+    });
+
+    await bucket.listSnapshotPrefixes();
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatch(/budget/);
+  });
+
+  it('reports truncation at the page cap as well as at the budget', async () => {
+    // The two bounds catch different failures and both need to be visible; a
+    // fast bucket with a huge number of snapshots hits the cap, never the clock.
+    const warnings: string[] = [];
+    const bucket = new GoogleCloudBucket({
+      bucket: 'test-bucket',
+      storage: makeFakeStorage(() => makeEndlessBucket({ t: 0 }, 0)),
+      listBudgetMs: 60_000,
+      onTruncated: (m) => warnings.push(m),
+      now: () => 0,
+    });
+
+    const prefixes = await bucket.listSnapshotPrefixes();
+    expect(prefixes).toHaveLength(100); // MAX_LIST_PAGES
+    expect(warnings[0]).toMatch(/page cap/);
+  });
+
+  it('says nothing when the listing completes', async () => {
+    // The warning must not fire on an ordinary listing, or a healthy sweep is
+    // indistinguishable from a degraded one.
+    const warnings: string[] = [];
+    const queries: Record<string, unknown>[] = [];
+    const bucket = new GoogleCloudBucket({
+      bucket: 'test-bucket',
+      storage: makeFakeStorage(() => makePagedBucketForBudgetTest(queries)),
+      onTruncated: (m) => warnings.push(m),
+    });
+
+    await bucket.listSnapshotPrefixes();
+    expect(warnings).toHaveLength(0);
+  });
+
+  /** A two-page bucket that terminates properly. */
+  function makePagedBucketForBudgetTest(captured: Record<string, unknown>[]): FakeBucketObject {
+    let page = 0;
+    return {
+      file(_key) {
+        return {
+          async download(): Promise<[Buffer]> {
+            return [Buffer.alloc(0)];
+          },
+          async save() {},
+        };
+      },
+      async getFiles(query) {
+        captured.push({ ...query });
+        page++;
+        const last = page >= 2;
+        return [
+          [],
+          last ? null : { pageToken: 'p2', autoPaginate: false },
+          { prefixes: [`snapshots/x${page}/`] },
+        ];
+      },
+      async deleteFiles() {},
+    };
+  }
+});

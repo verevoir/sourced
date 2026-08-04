@@ -79,14 +79,36 @@ const server = createServer(proxy, { info, allowedSources, rateLimiter });
 let gcTimer: NodeJS.Timeout | undefined;
 if (store) {
   const policy = new MaxAgePolicyMs(SNAPSHOT_TTL_MS);
+
+  // Half the interval, so a sweep always finishes with the interval to spare.
+  // A sweep costs a manifest read plus possibly a delete per snapshot, each with
+  // its own timeout — so bounding the individual calls bounds nothing in
+  // aggregate. Without a ceiling, sweeps outlast their own schedule, overlap,
+  // and pile up until the instance is doing nothing but garbage collection.
+  const GC_BUDGET_MS = Math.max(1_000, Math.floor(GC_INTERVAL_MS / 2));
+
+  // Belt to that budget's braces. The budget bounds a sweep that is merely slow;
+  // this bounds one wedged inside a call the budget cannot interrupt, because
+  // the budget is only checked BETWEEN snapshots.
+  let sweeping = false;
+
   const sweep = async () => {
+    if (sweeping) {
+      console.warn('gc: previous sweep still running — skipping this interval');
+      return;
+    }
+    sweeping = true;
     try {
-      const deleted = await runGc(store, policy, (m) => console.log(m));
+      const deleted = await runGc(store, policy, (m) => console.log(m), {
+        budgetMs: GC_BUDGET_MS,
+      });
       if (deleted > 0) console.log(`gc: swept ${deleted} expired snapshot(s)`);
     } catch (err) {
       // A failed sweep costs storage, never correctness — the cache stays
       // servable, so this must not take the process down.
       console.error(`gc: sweep failed: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      sweeping = false;
     }
   };
   gcTimer = setInterval(sweep, GC_INTERVAL_MS);
