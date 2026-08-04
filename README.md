@@ -116,6 +116,19 @@ the code path exercised locally is the deployed one.
 
 Deployed: `ai-gengy-spikes` / `europe-west2`, from source via Cloud Build.
 
+### Other platforms
+
+Nothing in the image is Cloud-Run-specific. The port, the store adapter and the
+token all arrive as configuration; `/healthz` answers the probe path k8s uses
+and `/health` the one most load balancers use; and the process handles SIGTERM
+by draining rather than dropping in-flight requests. So the same artefact runs
+under a local k8s cluster or anything else that can start a container and set
+environment variables.
+
+**No k8s manifests ship in this repo yet.** The image is ready for one; nobody
+has written it. `compose.yaml` is the only orchestration here, and it exists to
+run the *deployed* artefact locally rather than to be a production topology.
+
 ## Verifying
 
 ```sh
