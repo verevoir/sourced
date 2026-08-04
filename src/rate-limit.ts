@@ -86,11 +86,21 @@ export class TokenBucket {
   private refill(): void {
     const nowMs = this.now();
     const elapsedMs = nowMs - this.lastRefillMs;
-    // A clock that jumps backwards (NTP correction, container suspend) must not
-    // credit tokens or freeze the bucket; treat it as no elapsed time.
-    if (elapsedMs > 0) {
-      this.tokens = Math.min(this.capacity, this.tokens + (elapsedMs / 1000) * this.refillPerSecond);
+    if (elapsedMs <= 0) {
+      // A clock that jumps BACKWARDS (NTP correction, container suspend) must
+      // not move the reference point with it. Doing so looks harmless — no
+      // tokens are credited on the jump itself — but it re-opens an interval
+      // that has already been paid for: when the clock returns to where it was,
+      // that stretch is credited a SECOND time. A limiter that over-grants on a
+      // clock correction is a limiter an attacker can wait out.
+      //
+      // So the reference only ever moves forward. The cost is that a backward
+      // jump pauses refill until the clock catches up, which is the right way
+      // round for a limiter: briefly throttling a legitimate caller is
+      // recoverable, silently handing out a double allowance is not.
+      return;
     }
+    this.tokens = Math.min(this.capacity, this.tokens + (elapsedMs / 1000) * this.refillPerSecond);
     this.lastRefillMs = nowMs;
   }
 

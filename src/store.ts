@@ -397,10 +397,13 @@ export interface GcsBucket {
 /**
  * A `BlobStore` backed by Google Cloud Storage.
  *
- * **No GCS SDK dependency.** The `GcsBucket` port is injected; the real
- * implementation lives outside this file and is wired at startup. This
- * keeps the package free of a `@google-cloud/storage` dependency that
- * would bloat every consumer — the GCS wiring is the operator's concern.
+ * **No GCS SDK dependency IN THIS FILE.** The package does depend on
+ * `@google-cloud/storage` — the adapter has to talk to something — but the
+ * `GcsBucket` port is injected, so nothing in the core imports the SDK. What
+ * that buys is concrete: this class is testable against a fake with no
+ * credentials, and `gcs-bucket.ts` is loaded by a dynamic import so a
+ * filesystem-backed or in-memory run never pays to load the SDK or authenticate
+ * against it. The GCS wiring stays the operator's concern.
  *
  * Tests never instantiate this class with a real GCS bucket. They either
  * inject a `GcsBucket` fake or use `FilesystemBlobStore` entirely.

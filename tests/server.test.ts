@@ -171,6 +171,12 @@ describe('handleRequest — path traversal is refused, not sanitised', () => {
     ['a/../../b', 'traversal in the middle'],
     ['..\\windows\\system32', 'backslash separators'],
     ['/etc/passwd', 'absolute path'],
+    // A NUL truncates the string in any C-level path API underneath us, so
+    // `safe.txt\0../../etc/passwd` can pass a JS-side check and then be read as
+    // `safe.txt` — or, worse, the reverse. It survives the URL layer as %00, so
+    // the guard has to reject it here rather than assume it cannot arrive.
+    ['safe.txt\0../../etc/passwd', 'NUL byte truncation'],
+    ['\0', 'a bare NUL'],
   ])('400s %s (%s)', async (path) => {
     const url = `/v1/blob?source=org%2Frepo&sha=sha1&path=${encodeURIComponent(path)}`;
     expect((await handleRequest(makeProxy(), 'GET', url, ALLOW)).status).toBe(400);

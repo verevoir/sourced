@@ -73,6 +73,26 @@ describe('TokenBucket', () => {
     expect(bucket.take().ok).toBe(true); // refilled by 1.5 tokens → 1 available
   });
 
+  it('does not pay for the same interval twice after a clock jumps back and forward', () => {
+    // The subtle half of a backward jump. Moving the refill REFERENCE backwards
+    // credits nothing at the time, so it looks safe — but it re-opens a stretch
+    // of time that has already been paid for, and the return trip credits it a
+    // second time. A limiter that over-grants on an NTP correction is one an
+    // attacker can simply wait out.
+    let now = 0;
+    const bucket = new TokenBucket(10, 1, () => now);
+    for (let i = 0; i < 10; i++) bucket.take(); // empty at t=0
+
+    now = 5_000; // +5 s → 5 tokens, honestly earned
+    expect(Math.floor(bucket.available)).toBe(5);
+
+    now = 2_000; // clock corrects backwards
+    bucket.peek(); // an ordinary check, which is where the reference would move
+
+    now = 5_000; // and back to where it was — NO new time has actually passed
+    expect(Math.floor(bucket.available)).toBe(5); // not 8
+  });
+
   it('rejects a non-positive capacity at construction', () => {
     // A zero or negative capacity makes the bucket permanently empty, which is
     // an API misuse that should fail loudly rather than silently throttling
