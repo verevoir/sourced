@@ -122,8 +122,11 @@ Deployed: `ai-gengy-spikes` / `europe-west2`, from source via Cloud Build.
 npm run verify   # typecheck + tests
 ```
 
-Two cases in `tests/resolve-merge-base.test.ts` fail **on macOS only** and pass
-in CI, because they assert on a message whose wording depends on the host's
-locale (tracked as STDIO-637). If you see exactly those two red on a Mac, that
-is the known issue and not your change — but confirm the count, because a third
-failure is yours.
+The whole suite should be green on any host. Two cases in
+`tests/resolve-merge-base.test.ts` used to fail on macOS and pass in CI
+(STDIO-637), and the reason turned out to matter: `resolve-merge-base.sh`
+validates shas with a bracket expression, and a range like `a-f` is
+collation-ordered rather than byte-ordered. Under a locale that interleaves case
+— macOS's default — `A` sorts inside `a-f`, so the guard accepted a non-hex sha.
+It was failing **open**, on exactly the hosts nobody ran CI on. The script now
+sets `LC_ALL=C`.
