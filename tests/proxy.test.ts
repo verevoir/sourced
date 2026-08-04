@@ -494,3 +494,56 @@ describe('SourceProxy — a failed write-through is reported, not swallowed', ()
     expect(blob.toString('utf8')).toBe('A');
   });
 });
+
+describe('SourceProxy — the negative cache is bounded too', () => {
+  // The 404 cache is bounded only by TTL in principle, because an entry is
+  // removed when it is next ASKED FOR — and nothing ever asks again for a sha
+  // that does not exist. So a caller naming a stream of bad shas grows it for
+  // free. Small entries, but unbounded is unbounded.
+
+  /** A fetcher that 404s everything, counting attempts. */
+  function makeMissingFetcher() {
+    let attempts = 0;
+    const fetcher: TarballFetcher = {
+      async fetchTarball(_source, sha) {
+        attempts++;
+        throw new ProxyNotFoundError(`no such sha: ${sha}`);
+      },
+    };
+    return { fetcher, attempts: () => attempts };
+  }
+
+  it('evicts the OLDEST remembered 404 once the cap is reached', async () => {
+    const { fetcher, attempts } = makeMissingFetcher();
+    const proxy = new SourceProxy(fetcher, { maxNegativeEntries: 3 });
+
+    for (const sha of ['a', 'b', 'c']) {
+      await expect(proxy.getTree('org/repo', sha)).rejects.toThrow(ProxyNotFoundError);
+    }
+    expect(attempts()).toBe(3);
+
+    // A fourth distinct miss pushes the cap and must evict 'a', the oldest.
+    await expect(proxy.getTree('org/repo', 'd')).rejects.toThrow(ProxyNotFoundError);
+    expect(attempts()).toBe(4);
+
+    // 'a' was forgotten, so asking again costs a fresh upstream attempt...
+    await expect(proxy.getTree('org/repo', 'a')).rejects.toThrow(ProxyNotFoundError);
+    expect(attempts()).toBe(5);
+
+    // ...while 'd' is still remembered and costs nothing.
+    await expect(proxy.getTree('org/repo', 'd')).rejects.toThrow(ProxyNotFoundError);
+    expect(attempts()).toBe(5);
+  });
+
+  it('forgetting a 404 early costs an upstream call, never a wrong answer', async () => {
+    // The safety argument for evicting at all: the worst case is a wasted fetch.
+    // An evicted negative entry can only ever produce a fresh attempt, which
+    // re-derives the same verdict.
+    const { fetcher } = makeMissingFetcher();
+    const proxy = new SourceProxy(fetcher, { maxNegativeEntries: 1 });
+
+    await expect(proxy.getTree('org/repo', 'x')).rejects.toThrow(ProxyNotFoundError);
+    await expect(proxy.getTree('org/repo', 'y')).rejects.toThrow(ProxyNotFoundError);
+    await expect(proxy.getTree('org/repo', 'x')).rejects.toThrow(ProxyNotFoundError);
+  });
+});

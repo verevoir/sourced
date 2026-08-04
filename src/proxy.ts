@@ -77,6 +77,10 @@ export interface SourceProxyOptions {
    * snapshots are evicted until the total fits again. Default 128 MiB — see
    * `DEFAULT_MAX_CACHED_BYTES`. */
   maxCachedBytes?: number;
+  /** How many remembered 404s to hold before evicting the oldest. Default
+   * 10,000 — see `MAX_NEGATIVE_ENTRIES`. Injectable so the eviction can be
+   * tested at a size a test can reach. */
+  maxNegativeEntries?: number;
 }
 
 const DEFAULT_NEGATIVE_TTL_MS = 60_000;
@@ -101,7 +105,7 @@ const DEFAULT_MAX_CACHED_BYTES = 128 * 1024 * 1024;
 /** Cap on remembered 404s. Bounded by TTL only in principle — an entry is
  * removed when it is next asked for, so a caller naming many bad shas would
  * otherwise grow this map for free. Small, because it holds only a timestamp. */
-const MAX_NEGATIVE_ENTRIES = 10_000;
+const DEFAULT_MAX_NEGATIVE_ENTRIES = 10_000;
 
 function sourceKey(source: string, sha: string): string {
   return `${source}\u0000${sha}`;
@@ -126,6 +130,7 @@ export class SourceProxy {
   private readonly store?: BlobStore;
   private readonly maxCachedBytes: number;
   private readonly onStoreWriteError: (err: unknown) => void;
+  private readonly maxNegativeEntries: number;
 
   /** Successfully primed snapshots, in least-recently-used order — Map iterates
    * in insertion order, so `touch()` re-inserting on every hit makes the FIRST
@@ -159,6 +164,7 @@ export class SourceProxy {
     this.now = options.now ?? Date.now;
     this.store = options.store;
     this.maxCachedBytes = options.maxCachedBytes ?? DEFAULT_MAX_CACHED_BYTES;
+    this.maxNegativeEntries = options.maxNegativeEntries ?? DEFAULT_MAX_NEGATIVE_ENTRIES;
     this.onStoreWriteError =
       options.onStoreWriteError ??
       ((err) =>
@@ -302,7 +308,7 @@ export class SourceProxy {
       if (err instanceof ProxyNotFoundError) {
         // Oldest-first eviction, same Map-ordering trick as `primed`. Forgetting
         // a 404 early costs one wasted upstream call, never a wrong answer.
-        if (this.negativeTarball.size >= MAX_NEGATIVE_ENTRIES) {
+        if (this.negativeTarball.size >= this.maxNegativeEntries) {
           const oldest = this.negativeTarball.keys().next();
           if (!oldest.done) this.negativeTarball.delete(oldest.value);
         }
