@@ -476,3 +476,68 @@ describe('GoogleCloudBucket — the page walk is bounded in wall-clock too', () 
     };
   }
 });
+
+describe('GoogleCloudBucket — every method is bounded, not just the read path', () => {
+  // The class doc says "every method is bounded by timeoutMs", and the writes
+  // are where an unbounded call bites hardest: `upload` runs inside the
+  // write-through of a prime, and `deletePrefix` inside a GC sweep whose own
+  // budget is only checked BETWEEN snapshots — so a wedged delete stalls the
+  // sweep past any budget the sweep itself can enforce.
+
+  /** A bucket where nothing but `download` ever settles. */
+  function makeStuckWriter(): FakeBucketObject {
+    return {
+      file(_key) {
+        return {
+          async download(): Promise<[Buffer]> {
+            return [Buffer.alloc(0)];
+          },
+          save(): Promise<void> {
+            return new Promise(() => {
+              /* never */
+            });
+          },
+        };
+      },
+      async getFiles(_q) {
+        return [[], null, {}];
+      },
+      deleteFiles(_opts): Promise<void> {
+        return new Promise(() => {
+          /* never */
+        });
+      },
+    };
+  }
+
+  it('gives up on an upload that never completes', async () => {
+    const bucket = new GoogleCloudBucket({
+      bucket: 'test-bucket',
+      storage: makeFakeStorage(() => makeStuckWriter()),
+      timeoutMs: 20,
+    });
+    await expect(
+      bucket.upload('blobs/key', Buffer.from('x'), 'application/octet-stream')
+    ).rejects.toThrow(/exceeded 20ms/);
+  });
+
+  it('gives up on a prefix delete that never completes', async () => {
+    const bucket = new GoogleCloudBucket({
+      bucket: 'test-bucket',
+      storage: makeFakeStorage(() => makeStuckWriter()),
+      timeoutMs: 20,
+    });
+    await expect(bucket.deletePrefix('snapshots/abc/')).rejects.toThrow(/exceeded 20ms/);
+  });
+
+  it('names the operation it gave up on', async () => {
+    // A bare "timed out" in a log leaves an operator guessing which of four
+    // calls stalled and against which key.
+    const bucket = new GoogleCloudBucket({
+      bucket: 'test-bucket',
+      storage: makeFakeStorage(() => makeStuckWriter()),
+      timeoutMs: 20,
+    });
+    await expect(bucket.deletePrefix('snapshots/abc/')).rejects.toThrow(/snapshots\/abc\//);
+  });
+});
