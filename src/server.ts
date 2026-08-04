@@ -10,7 +10,11 @@
 // would actually run; it is exercised by nothing but its own type-check,
 // which is fine — sockets have nothing to do with S0's properties.
 
-import { createServer as createHttpServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import {
+  createServer as createHttpServer,
+  type IncomingMessage,
+  type ServerResponse,
+} from 'node:http';
 import type { SourceProxy } from './proxy.js';
 import { ProxyNotFoundError } from './errors.js';
 
@@ -18,6 +22,25 @@ export interface ProxyResponse {
   status: number;
   headers: Record<string, string>;
   body: Buffer | string;
+}
+
+/** Everything the request boundary needs that the library cannot know. */
+export interface ServerOptions {
+  info?: ServiceInfo;
+  /**
+   * Sources this service will fetch, as `owner/repo`.
+   *
+   * LOAD-BEARING, not a convenience. The service applies its OWN `GITHUB_TOKEN`
+   * to whatever `source` a caller names, so without this a caller who can reach
+   * `/v1/blob` can read every private repository that token can read — the
+   * service becomes a confused deputy for its own credential.
+   *
+   * Absent or empty means DENY EVERYTHING. Failing closed is the only safe
+   * default for a credential-bearing proxy: a misconfiguration must cost
+   * availability, never confidentiality. S0's design says the same thing in
+   * different words — "/v1/blob for one hardcoded corpus repo".
+   */
+  allowedSources?: ReadonlySet<string>;
 }
 
 /** What `/healthz` reports: up, which build, and which store is wired in.
@@ -66,6 +89,46 @@ function requireParams(
   return out;
 }
 
+/**
+ * Refuse any source not explicitly allowed, and say nothing about why beyond
+ * that it is not served — whether a given private repo exists is not this
+ * service's to disclose.
+ *
+ * Returns a response to send, or `null` to continue.
+ */
+function denySource(
+  source: string,
+  allowed: ReadonlySet<string> | undefined
+): ProxyResponse | null {
+  if (allowed && allowed.has(source)) return null;
+  return jsonResponse(403, {
+    error: 'source_not_allowed',
+    message: 'this service does not serve that source',
+  });
+}
+
+/**
+ * Refuse a path that could escape its snapshot, rather than trying to clean it.
+ *
+ * Sanitising is what produced the hole this replaces: a single-pass strip of
+ * `../` turns `....//foo` into `../foo` — it MANUFACTURES the traversal it was
+ * meant to remove. Rejection has no such failure mode, and a caller has no
+ * legitimate reason to ask for a path outside the tree it just listed.
+ */
+function denyPath(path: string): ProxyResponse | null {
+  const normalised = path.replace(/\\/g, '/');
+  const traversal = normalised.split('/').some((seg) => seg === '..');
+  const absolute = normalised.startsWith('/');
+  const nulByte = path.includes('\0');
+  if (traversal || absolute || nulByte) {
+    return jsonResponse(400, {
+      error: 'bad_request',
+      message: 'path must be relative to the snapshot and contain no ".." segment',
+    });
+  }
+  return null;
+}
+
 /** Pure request handler: `(method, url) -> response`, with no dependency on
  * `node:http` beyond the types it borrows for parsing. This is what the
  * test suite drives directly. */
@@ -73,8 +136,9 @@ export async function handleRequest(
   proxy: SourceProxy,
   method: string,
   url: string,
-  info?: ServiceInfo
+  opts: ServerOptions = {}
 ): Promise<ProxyResponse> {
+  const { info, allowedSources } = opts;
   if (method !== 'GET') {
     return jsonResponse(405, { error: 'method_not_allowed' });
   }
@@ -109,11 +173,22 @@ export async function handleRequest(
   if (parsed.pathname === '/v1/blob') {
     const params = requireParams(parsed.searchParams, ['source', 'sha', 'path']);
     if (!params) {
-      return jsonResponse(400, { error: 'bad_request', message: 'source, sha and path are required' });
+      return jsonResponse(400, {
+        error: 'bad_request',
+        message: 'source, sha and path are required',
+      });
     }
+    const denied = denySource(params.source, allowedSources);
+    if (denied) return denied;
+    const badPath = denyPath(params.path);
+    if (badPath) return badPath;
     try {
       const content = await proxy.getBlob(params.source, params.sha, params.path);
-      return { status: 200, headers: { 'content-type': 'application/octet-stream' }, body: content };
+      return {
+        status: 200,
+        headers: { 'content-type': 'application/octet-stream' },
+        body: content,
+      };
     } catch (err) {
       return errorResponse(err);
     }
@@ -122,8 +197,13 @@ export async function handleRequest(
   if (parsed.pathname === '/v1/tree') {
     const params = requireParams(parsed.searchParams, ['source', 'sha']);
     if (!params) {
-      return jsonResponse(400, { error: 'bad_request', message: 'source and sha are required' });
+      return jsonResponse(400, {
+        error: 'bad_request',
+        message: 'source and sha are required',
+      });
     }
+    const denied = denySource(params.source, allowedSources);
+    if (denied) return denied;
     try {
       const entries = await proxy.getTree(params.source, params.sha);
       return jsonResponse(200, { entries });
@@ -132,19 +212,22 @@ export async function handleRequest(
     }
   }
 
-  return jsonResponse(404, { error: 'not_found', message: `no route for ${parsed.pathname}` });
+  return jsonResponse(404, {
+    error: 'not_found',
+    message: `no route for ${parsed.pathname}`,
+  });
 }
 
 /** Thin `node:http` wrapper around `handleRequest` — what an operator
  * actually runs. Not exercised by the test suite (see module doc); the
  * behaviour it depends on is fully covered via `handleRequest` directly. */
-export function createServer(proxy: SourceProxy, info?: ServiceInfo) {
+export function createServer(proxy: SourceProxy, opts: ServerOptions = {}) {
   return createHttpServer(async (req: IncomingMessage, res: ServerResponse) => {
     // A throw here would take down the whole process via node:http's
     // 'uncaughtException' path, so one bad request cannot be allowed to become an
     // outage: every failure is mapped to a 500 the client can read.
     try {
-      const response = await handleRequest(proxy, req.method ?? 'GET', req.url ?? '/', info);
+      const response = await handleRequest(proxy, req.method ?? 'GET', req.url ?? '/', opts);
       res.writeHead(response.status, response.headers);
       res.end(response.body);
     } catch (err) {

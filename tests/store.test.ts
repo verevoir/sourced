@@ -146,9 +146,7 @@ describe('FilesystemBlobStore', () => {
       sourceUrl: SOURCE,
       sha: SHA,
       createdAt: '2024-01-01T00:00:00.000Z',
-      entries: [
-        { path: 'src/index.ts', type: 'blob', size: 21, sha: 'deadbeef' },
-      ],
+      entries: [{ path: 'src/index.ts', type: 'blob', size: 21, sha: 'deadbeef' }],
     };
     await store.putTreeManifest(SOURCE, SHA, manifest);
     const result = await store.getTreeManifest(SOURCE, SHA);
@@ -434,7 +432,9 @@ describe('SourceProxy with persistence', () => {
     const store = new FilesystemBlobStore(baseDir);
     let fetchCount = 0;
     let releaseResolve!: () => void;
-    const releaseP = new Promise<void>((resolve) => { releaseResolve = resolve; });
+    const releaseP = new Promise<void>((resolve) => {
+      releaseResolve = resolve;
+    });
     const fetcher: TarballFetcher = {
       async fetchTarball() {
         fetchCount++;
@@ -489,5 +489,37 @@ describe('SourceProxy with persistence', () => {
     // Second call — served from in-memory, no second fetch.
     await proxy.getBlob('org/repo', 'sha1', 'src/util.ts');
     expect(getCallCount()).toBe(1);
+  });
+});
+
+describe('blobKey — refuses an escaping path instead of sanitising it', () => {
+  // The regression this replaces: a single-pass strip of `../` MANUFACTURED the
+  // traversal it was meant to remove — `....//foo` became `../foo`, which then
+  // escaped baseDir through path.join in the filesystem adapter.
+  it('never emits a ".." segment for the input that broke the old sanitiser', () => {
+    // `....//foo` is NOT itself a traversal — `....` is an ordinary directory
+    // name. It was only dangerous because the strip rewrote it. Asserting on the
+    // emitted key is what proves the rewrite is gone, rather than asserting a
+    // rejection that would not be correct.
+    const key = blobKey('org/repo', 'sha1', '....//foo');
+    expect(key.split('/')).not.toContain('..');
+  });
+
+  it.each(['../escape', 'a/../../b', '..\\win'])('throws on %s', (path) => {
+    expect(() => blobKey('org/repo', 'sha1', path)).toThrow(/escape its snapshot/);
+  });
+
+  it('makes an absolute path relative rather than throwing — it cannot escape', () => {
+    // Distinct from a `..` segment: a leading slash is neutralised by stripping,
+    // which cannot manufacture a traversal the way the old `../` strip could. The
+    // ROUTE still rejects it outright (see denyPath) — this is the second line,
+    // asserting the key itself is safe rather than that the input was refused.
+    const key = blobKey('org/repo', 'sha1', '/abs');
+    expect(key.split('/')).not.toContain('..');
+    expect(key).toMatch(/\/blobs\/abs$/);
+  });
+
+  it('still builds a key for a legitimate nested path', () => {
+    expect(blobKey('org/repo', 'sha1', 'src/index.ts')).toMatch(/\/blobs\/src\/index\.ts$/);
   });
 });

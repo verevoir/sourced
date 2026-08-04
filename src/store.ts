@@ -27,15 +27,7 @@
 //    worst-case is "keeps too much"; it must NEVER be "deleted something
 //    still referenced". See the policy's doc comment for the argument.
 
-import {
-  mkdir,
-  readFile,
-  writeFile,
-  readdir,
-  stat,
-  unlink,
-  rmdir,
-} from 'node:fs/promises';
+import { mkdir, readFile, writeFile, readdir, stat, unlink, rmdir } from 'node:fs/promises';
 import { join, dirname } from 'node:path';
 import { createHash } from 'node:crypto';
 import type { TreeEntry } from './tree.js';
@@ -51,9 +43,21 @@ export function blobKey(sourceUrl: string, sha: string, path: string): string {
   // sha component in the path so blobs for the same snapshot are co-located
   // and GC can scan by snapshot.
   const snapshotId = snapshotKey(sourceUrl, sha);
-  // path-within-snapshot: preserve the relative path for human readability
-  // but sanitise it so it can't escape the base directory.
-  const safePath = path.replace(/\.\.\/|\.\.\\/g, '').replace(/^[\/\\]+/, '');
+  // path-within-snapshot: preserve the relative path for human readability, but
+  // REFUSE anything that could escape the snapshot rather than trying to clean it.
+  //
+  // The previous single-pass strip of `../` manufactured the traversal it meant to
+  // remove: `....//foo` -> `../foo`, which then escaped `baseDir` through
+  // `path.join` in the filesystem adapter. Rejection has no such failure mode.
+  // The request boundary rejects these too (see `denyPath` in server.ts); this is
+  // the second line, because a key builder must be safe for every caller, not only
+  // the one that happens to validate first.
+  const safePath = path.replace(/\\/g, '/').replace(/^\/+/, '');
+  if (safePath.split('/').some((seg) => seg === '..') || path.includes('\0')) {
+    throw new Error(
+      `blobKey: refusing a path that could escape its snapshot: ${JSON.stringify(path)}`
+    );
+  }
   return `${snapshotId}/blobs/${safePath}`;
 }
 
@@ -65,9 +69,7 @@ export function treeManifestKey(sourceUrl: string, sha: string): string {
 /** The directory / prefix that contains every blob and the tree manifest
  * for one `(sourceUrl, sha)`. Used by GC to enumerate snapshots. */
 export function snapshotKey(sourceUrl: string, sha: string): string {
-  const hash = createHash('sha256')
-    .update(`${sourceUrl}\0${sha}`)
-    .digest('hex');
+  const hash = createHash('sha256').update(`${sourceUrl}\0${sha}`).digest('hex');
   return `snapshots/${hash}`;
 }
 
@@ -222,7 +224,9 @@ export async function runGc(
       log(`gc: deleted snapshot ${key}`);
       deleted++;
     } catch (err) {
-      log(`gc: failed to delete snapshot ${key}: ${err instanceof Error ? err.message : String(err)}`);
+      log(
+        `gc: failed to delete snapshot ${key}: ${err instanceof Error ? err.message : String(err)}`
+      );
     }
   }
   return deleted;

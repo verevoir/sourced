@@ -22,6 +22,11 @@ services:
       - '8080:8080'
     environment:
       PORT: '8080'
+      # Which sources this service will serve. REQUIRED — empty means deny
+      # everything. The service applies its own GITHUB_TOKEN to whatever source a
+      # caller names, so without this list any caller could read every private
+      # repo that token can read.
+      SOURCED_ALLOWED_SOURCES: ${SOURCED_ALLOWED_SOURCES:-verevoir/accelerator}
       # Filesystem adapter — the local counterpart of SOURCED_GCS_BUCKET.
       SOURCED_FS_DIR: /var/cache/sourced
       # Minutes: this cache exists to stop the same file being fetched thirty

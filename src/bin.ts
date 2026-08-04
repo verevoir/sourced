@@ -39,7 +39,10 @@ const PORT = Number(process.env.PORT ?? 8080);
 const SNAPSHOT_TTL_MS = Number(process.env.SOURCED_SNAPSHOT_TTL_MS ?? 30 * 60_000);
 const GC_INTERVAL_MS = Number(process.env.SOURCED_GC_INTERVAL_MS ?? 5 * 60_000);
 
-async function buildStore(): Promise<{ store?: BlobStore; kind: ServiceInfo['store'] }> {
+async function buildStore(): Promise<{
+  store?: BlobStore;
+  kind: ServiceInfo['store'];
+}> {
   const bucket = process.env.SOURCED_GCS_BUCKET?.trim();
   const dir = process.env.SOURCED_FS_DIR?.trim();
 
@@ -53,7 +56,10 @@ async function buildStore(): Promise<{ store?: BlobStore; kind: ServiceInfo['sto
     // authenticate — by a filesystem-backed or in-memory run. This is a dynamic
     // import, not require: the package is ESM and require is not defined here.
     const { GoogleCloudBucket } = await import('./gcs-bucket.js');
-    return { store: new GcsBlobStore(new GoogleCloudBucket({ bucket })), kind: 'gcs' };
+    return {
+      store: new GcsBlobStore(new GoogleCloudBucket({ bucket })),
+      kind: 'gcs',
+    };
   }
   if (dir) return { store: new FilesystemBlobStore(dir), kind: 'filesystem' };
   return { store: undefined, kind: 'memory' };
@@ -68,11 +74,22 @@ const info: ServiceInfo = {
   store: kind,
 };
 
+// Which sources this service will serve. The token it holds is ITS credential,
+// not the caller's, so without an explicit list any caller reaching /v1/blob
+// could read every private repo that token can read. Empty means deny
+// everything: a misconfiguration must cost availability, never confidentiality.
+const allowedSources = new Set(
+  (process.env.SOURCED_ALLOWED_SOURCES ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+);
+
 const proxy = new SourceProxy(new GithubCodeloadFetcher({ token: process.env.GITHUB_TOKEN }), {
   store,
 });
 
-const server = createServer(proxy, info);
+const server = createServer(proxy, { info, allowedSources });
 
 // GC only runs where there is something durable to collect: an in-memory run has
 // no store to sweep, and a sweep against `undefined` would be a no-op that still
@@ -105,6 +122,9 @@ server.listen(PORT, () => {
       snapshotTtlMs: SNAPSHOT_TTL_MS,
       gcIntervalMs: store ? GC_INTERVAL_MS : null,
       authenticated: Boolean(process.env.GITHUB_TOKEN), // whether, never what
+      // Loud on purpose: a service that serves nothing looks identical to a
+      // broken one from outside, and this is the likeliest misconfiguration.
+      allowedSources: [...allowedSources],
     })
   );
 });

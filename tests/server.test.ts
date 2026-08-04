@@ -3,6 +3,10 @@ import { SourceProxy, type TarballFetcher } from '../src/proxy.js';
 import { handleRequest } from '../src/server.js';
 import { buildFakeTarballGz } from './helpers/tarball.js';
 
+// The allowlist is fail-closed, so every route test must state which sources it
+// permits — the same thing the deployment states in SOURCED_ALLOWED_SOURCES.
+const ALLOW = { allowedSources: new Set(['a/b', 'org/repo']) } as const;
+
 function makeProxy(): SourceProxy {
   const fetcher: TarballFetcher = {
     async fetchTarball() {
@@ -21,7 +25,8 @@ describe('handleRequest — /v1/blob', () => {
     const res = await handleRequest(
       proxy,
       'GET',
-      '/v1/blob?source=org%2Frepo&sha=sha1&path=src%2Findex.ts'
+      '/v1/blob?source=org%2Frepo&sha=sha1&path=src%2Findex.ts',
+      ALLOW
     );
     expect(res.status).toBe(200);
     expect(res.body.toString('utf8')).toBe('export const a = 1;\n');
@@ -29,7 +34,7 @@ describe('handleRequest — /v1/blob', () => {
 
   it('400s when a required param is missing', async () => {
     const proxy = makeProxy();
-    const res = await handleRequest(proxy, 'GET', '/v1/blob?source=org%2Frepo&sha=sha1');
+    const res = await handleRequest(proxy, 'GET', '/v1/blob?source=org%2Frepo&sha=sha1', ALLOW);
     expect(res.status).toBe(400);
   });
 
@@ -38,7 +43,8 @@ describe('handleRequest — /v1/blob', () => {
     const res = await handleRequest(
       proxy,
       'GET',
-      '/v1/blob?source=org%2Frepo&sha=sha1&path=nope.txt'
+      '/v1/blob?source=org%2Frepo&sha=sha1&path=nope.txt',
+      ALLOW
     );
     expect(res.status).toBe(404);
   });
@@ -47,7 +53,7 @@ describe('handleRequest — /v1/blob', () => {
 describe('handleRequest — /v1/tree', () => {
   it('200s with the entry list', async () => {
     const proxy = makeProxy();
-    const res = await handleRequest(proxy, 'GET', '/v1/tree?source=org%2Frepo&sha=sha1');
+    const res = await handleRequest(proxy, 'GET', '/v1/tree?source=org%2Frepo&sha=sha1', ALLOW);
     expect(res.status).toBe(200);
     const parsed = JSON.parse(res.body.toString());
     expect(Array.isArray(parsed.entries)).toBe(true);
@@ -56,7 +62,7 @@ describe('handleRequest — /v1/tree', () => {
 
   it('400s when sha is missing', async () => {
     const proxy = makeProxy();
-    const res = await handleRequest(proxy, 'GET', '/v1/tree?source=org%2Frepo');
+    const res = await handleRequest(proxy, 'GET', '/v1/tree?source=org%2Frepo', ALLOW);
     expect(res.status).toBe(400);
   });
 });
@@ -64,13 +70,13 @@ describe('handleRequest — /v1/tree', () => {
 describe('handleRequest — routing + method', () => {
   it('404s an unknown route', async () => {
     const proxy = makeProxy();
-    const res = await handleRequest(proxy, 'GET', '/v1/nope');
+    const res = await handleRequest(proxy, 'GET', '/v1/nope', ALLOW);
     expect(res.status).toBe(404);
   });
 
   it('405s a non-GET method', async () => {
     const proxy = makeProxy();
-    const res = await handleRequest(proxy, 'POST', '/v1/blob?source=a%2Fb&sha=s&path=p');
+    const res = await handleRequest(proxy, 'POST', '/v1/blob?source=a%2Fb&sha=s&path=p', ALLOW);
     expect(res.status).toBe(405);
   });
 });
@@ -90,13 +96,94 @@ describe('handleRequest — a burst through the HTTP layer still primes once', (
     const proxy = new SourceProxy(fetcher);
 
     const requests = [
-      handleRequest(proxy, 'GET', '/v1/blob?source=org%2Frepo&sha=sha1&path=a.txt'),
-      handleRequest(proxy, 'GET', '/v1/blob?source=org%2Frepo&sha=sha1&path=b.txt'),
-      handleRequest(proxy, 'GET', '/v1/tree?source=org%2Frepo&sha=sha1'),
+      handleRequest(proxy, 'GET', '/v1/blob?source=org%2Frepo&sha=sha1&path=a.txt', ALLOW),
+      handleRequest(proxy, 'GET', '/v1/blob?source=org%2Frepo&sha=sha1&path=b.txt', ALLOW),
+      handleRequest(proxy, 'GET', '/v1/tree?source=org%2Frepo&sha=sha1', ALLOW),
     ];
     const results = await Promise.all(requests);
     expect(fetchCount).toBe(1);
     expect(results.every((r) => r.status === 200)).toBe(true);
+  });
+});
+
+describe('handleRequest — the source allowlist (the service lends its own credential)', () => {
+  // The service applies ITS token to whatever source a caller names. Without the
+  // allowlist, anyone who can reach /v1/blob can read every private repo that
+  // token can read — the service is a confused deputy for its own credential.
+  it.each(['/v1/blob?source=evil%2Frepo&sha=s&path=p', '/v1/tree?source=evil%2Frepo&sha=s'])(
+    '403s a source that is not allowed: %s',
+    async (url) => {
+      expect((await handleRequest(makeProxy(), 'GET', url, ALLOW)).status).toBe(403);
+    }
+  );
+
+  it.each([
+    ['no options at all', undefined],
+    ['an empty allowlist', { allowedSources: new Set<string>() }],
+  ])('DENIES everything when configured with %s — fail closed', async (_label, opts) => {
+    // A misconfiguration must cost availability, never confidentiality. If this
+    // ever inverts, a deploy that forgets the env var silently serves everything.
+    const res = await handleRequest(
+      makeProxy(),
+      'GET',
+      '/v1/blob?source=org%2Frepo&sha=sha1&path=src%2Findex.ts',
+      opts
+    );
+    expect(res.status).toBe(403);
+  });
+
+  it('never fetches upstream for a denied source', async () => {
+    // The refusal must happen BEFORE the prime, or a denied caller still spends
+    // the service's upstream budget and can warm its cache.
+    let fetched = false;
+    const fetcher: TarballFetcher = {
+      async fetchTarball() {
+        fetched = true;
+        return buildFakeTarballGz([{ path: 'a', content: 'a' }]);
+      },
+    };
+    await handleRequest(
+      new SourceProxy(fetcher),
+      'GET',
+      '/v1/tree?source=evil%2Frepo&sha=s',
+      ALLOW
+    );
+    expect(fetched).toBe(false);
+  });
+
+  it('does not disclose whether a denied source exists', async () => {
+    const body = JSON.parse(
+      String(
+        (await handleRequest(makeProxy(), 'GET', '/v1/tree?source=evil%2Frepo&sha=s', ALLOW)).body
+      )
+    );
+    expect(JSON.stringify(body)).not.toMatch(/evil/);
+  });
+});
+
+describe('handleRequest — path traversal is refused, not sanitised', () => {
+  // Sanitising is what produced the hole this replaces: one pass of `../`
+  // stripping turns `....//foo` into `../foo`, MANUFACTURING the traversal.
+  it.each([
+    ['../etc/passwd', 'plain traversal'],
+    ['a/../../b', 'traversal in the middle'],
+    ['..\\windows\\system32', 'backslash separators'],
+    ['/etc/passwd', 'absolute path'],
+  ])('400s %s (%s)', async (path) => {
+    const url = `/v1/blob?source=org%2Frepo&sha=sha1&path=${encodeURIComponent(path)}`;
+    expect((await handleRequest(makeProxy(), 'GET', url, ALLOW)).status).toBe(400);
+  });
+
+  it('still serves a legitimate nested path', async () => {
+    // The guard must not be so blunt it breaks the normal case — `..` as a
+    // SEGMENT is the hazard, not the characters appearing anywhere.
+    const res = await handleRequest(
+      makeProxy(),
+      'GET',
+      '/v1/blob?source=org%2Frepo&sha=sha1&path=src%2Findex.ts',
+      ALLOW
+    );
+    expect(res.status).toBe(200);
   });
 });
 
@@ -123,12 +210,14 @@ describe('handleRequest — /healthz', () => {
     // operator cannot tell a stale revision from a current one, or a run that
     // silently fell back to memory from one using its bucket.
     const res = await handleRequest(makeProxy(), 'GET', '/healthz', {
+      info: { version: '9.9.9', revision: 'sourced-00042-abc', store: 'gcs' },
+    });
+    const body = JSON.parse(String(res.body));
+    expect(body).toMatchObject({
       version: '9.9.9',
       revision: 'sourced-00042-abc',
       store: 'gcs',
     });
-    const body = JSON.parse(String(res.body));
-    expect(body).toMatchObject({ version: '9.9.9', revision: 'sourced-00042-abc', store: 'gcs' });
   });
 
   it('degrades to "unknown" rather than lying when no info is supplied', async () => {
