@@ -1,10 +1,14 @@
-// Real `TarballFetcher` — fetches from codeload.github.com. Wires the
-// proxy core to actual GitHub for anyone running the server; NOT exercised
-// by any test (the task's hard constraint: no real network in tests, and
-// no burst against the live API to "test" rate limiting — that experiment
-// stays a proposal, see the report). `SourceProxy` itself only ever sees
-// the `TarballFetcher` interface, so this file is swappable and, more
-// importantly, untouched by the property tests in `tests/proxy.test.ts`.
+// Real `TarballFetcher` — fetches from codeload.github.com. Wires the proxy
+// core to actual GitHub for anyone running the server.
+//
+// It IS covered, by `tests/fetcher.test.ts`, through the injected `fetchImpl`
+// seam: URL building, status mapping, the abort signal and the timeout. What no
+// test does is touch the NETWORK — the hard constraint is no real requests, and
+// in particular no burst against the live API to "test" rate limiting; that
+// experiment stays a proposal, see the report.
+//
+// `SourceProxy` itself only ever sees the `TarballFetcher` interface, so this
+// file is swappable and untouched by the property tests in `tests/proxy.test.ts`.
 //
 // `source` here is `owner/repo` — deliberately narrower than the
 // `sources/github` adapter's `parseGithubRepoUrl` (which also accepts full

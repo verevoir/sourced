@@ -20,8 +20,12 @@
 //      • `FilesystemBlobStore` — exercises the same interface in tests and
 //        in local dev; vitest uses real `node:fs` on a `os.tmpdir()`
 //        directory, which is fast and does not need credentials.
-//      • `GcsBlobStore` — thin adapter over the GCS JSON API; only used
-//        when a real bucket is configured. Tests NEVER touch it.
+//      • `GcsBlobStore` — thin adapter over the `GcsBucket` port; the only
+//        one used when a real bucket is configured. Tests DO exercise it,
+//        against a fake bucket — what they never touch is real GCS, so no
+//        credentials and no network. Note the fake has to answer the way GCS
+//        actually answers: one that was kinder than the real thing hid a bug
+//        where GC silently collected nothing for as long as it existed.
 //
 // 4. GC POLICY (see `GcPolicy` below). The only safe direction for the
 //    worst-case is "keeps too much"; it must NEVER be "deleted something
