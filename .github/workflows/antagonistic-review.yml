@@ -18,18 +18,15 @@
 # (no-standing-auth-bypass). It authenticates two clones: the reviewer package, and
 # the guardrails corpus.
 #
-# The corpus is CLONED, not read through the contents API. Fifteen practice bodies
-# per lens, five lenses per PR, every PR in the fleet, all against one App
-# installation's single 5000/hr budget — enough that an eleven-repo rollout
-# exhausted it and failed the fleet closed (STDIO-663). A clone costs none of that
-# budget, and a corpus already on disk cannot fail to fetch mid-review.
+# The corpus is CLONED, not read through the contents API — see the corpus step
+# below for why, and `scripts/checkout-corpus.sh` in the reviewer package for how.
 #
 # Both clones authenticate with the token as a repo-local http.extraheader (init ->
 # local config -> fetch, the actions/checkout pattern) — never in the clone URL, argv,
 # or a job-global config (STDIO-551). The reviewer clone's header lives as long as
-# its directory; the corpus clone's is REMOVED as soon as its fetch is done, because
-# that directory is deliberately kept for the review step to read, and a lens with
-# Bash has no business finding a usable credential in it.
+# its directory; the corpus clone's is REMOVED as soon as its fetch is done, and
+# that removal is enforced by a test in the package that owns the script, not by
+# this claim ("retires the credential even when the fetch fails").
 #
 # Tamper model: runs on `pull_request_target`, so GitHub evaluates the workflow AND all
 # gate config (this file, the prompt, `mcp.json`, `aggregate.sh`) from the BASE branch —
@@ -302,17 +299,19 @@ jobs:
           test -f "$D/dist/bin.js" && echo "reviewer MCP built at $D/dist/bin.js"
 
       - name: Check out the guardrails corpus (read it from disk, not the REST API)
-        # WHY A CLONE. Each lens reads ~15 practice bodies. Through the contents API
-        # that is ~15 REST calls per lens, five lenses per PR, every PR in the fleet,
-        # all against ONE App installation's single 5000/hr budget — enough that an
-        # eleven-repo rollout exhausted it and failed every job in the fleet closed,
-        # plain `ci` included, since minting the token draws on the same budget
-        # (STDIO-663). A clone costs none of that budget, and a corpus already on
-        # disk cannot fail to fetch mid-review (STDIO-661).
+        # WHY A CLONE, stated here and only here. Each lens reads ~15 practice bodies.
+        # Through the contents API that is ~15 REST calls per lens, five lenses per
+        # PR, every PR in the fleet, all against ONE App installation's single
+        # 5000/hr budget — enough that an eleven-repo rollout exhausted it and failed
+        # every job in the fleet closed, plain `ci` included, since minting the token
+        # draws on the same budget (STDIO-663). A clone costs none of that budget,
+        # and a corpus already on disk cannot fail to fetch mid-review (STDIO-661).
         #
         # The script lives in the reviewer package, pinned to the same immutable sha
-        # as the reviewer itself and tested there rather than copied per repo
-        # (STDIO-662). The path below is the clone the step above just made.
+        # as the reviewer itself, and its guards — fail-closed on an empty corpus,
+        # credential retired even when the fetch fails, bounded fetch — are covered
+        # by tests THERE rather than restated as claims here (STDIO-662). The path
+        # below is the clone the step above just made.
         #
         # A shallow clone of a prose repo is seconds; 3m is retry room, not a budget.
         # The script bounds the fetch itself, so a hung network call names the
