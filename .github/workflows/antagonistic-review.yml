@@ -15,10 +15,18 @@
 # its PRIVATE repo (see mcp.json). Credentials: a GitHub App (VEREVOIR_APP_ID /
 # VEREVOIR_APP_PRIVATE_KEY) mints a per-run, least-privilege installation token
 # (Contents:read, scoped to capabilities + aigency-guardrails) — NO standing PAT
-# (no-standing-auth-bypass). It both clones that private repo and reads the corpus.
-# That clone authenticates with the token as a repo-local http.extraheader (init ->
+# (no-standing-auth-bypass). It authenticates two clones: the reviewer package, and
+# the guardrails corpus.
+#
+# The corpus is CLONED, not read through the contents API — see the corpus step
+# below for why, and `scripts/checkout-corpus.sh` in the reviewer package for how.
+#
+# Both clones authenticate with the token as a repo-local http.extraheader (init ->
 # local config -> fetch, the actions/checkout pattern) — never in the clone URL, argv,
-# or a job-global config, and torn down with the clone dir (STDIO-551).
+# or a job-global config (STDIO-551). The reviewer clone's header lives as long as
+# its directory; the corpus clone's is REMOVED as soon as its fetch is done, and
+# that removal is enforced by a test in the package that owns the script, not by
+# this claim ("retires the credential even when the fetch fails").
 #
 # Tamper model: runs on `pull_request_target`, so GitHub evaluates the workflow AND all
 # gate config (this file, the prompt, `mcp.json`, `aggregate.sh`) from the BASE branch —
@@ -78,10 +86,15 @@ jobs:
     # workflow_dispatch still enters and is refused by the resolve step's vacuous guard.
     if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
     # Every step below carries its own timeout-minutes; this job envelope is only a
-    # backstop ABOVE their sum (mint 5 + preflight 2 + checkout 5 + head-fetch 3 +
-    # resolve-merge-base 2 + url-rewrite 2 + MCP pre-build 10 + model 12 +
-    # publish 5 + verdict-surface 2 = 48m), so a hung step fails legibly at the
-    # step, not here.
+    # backstop ABOVE their sum, so a hung step fails legibly AT THE STEP that hung
+    # rather than as an anonymous job timeout. Keep the list complete and keep the
+    # envelope above it — before this change the tally omitted materialize-head and
+    # so read 48 against a real 50, which is precisely how adding one more step can
+    # invert the invariant the comment exists to protect.
+    #
+    #   mint 5 + preflight 2 + checkout 5 + head-fetch 3 + materialize-head 2 +
+    #   resolve-merge-base 2 + url-rewrite 2 + MCP pre-build 10 + corpus 3 +
+    #   model 12 + publish 5 + verdict-surface 2 = 53m
     timeout-minutes: 55
     strategy:
       fail-fast: false
@@ -122,7 +135,7 @@ jobs:
       # token (Contents:read, scoped to just the repos the gate reads) — no standing
       # PAT. The step fails the job if the App creds are absent, so a missing
       # credential is fail-closed by construction.
-      - name: Mint an ephemeral GitHub App token (reviewer-MCP clone + corpus read)
+      - name: Mint an ephemeral GitHub App token (for both clones — reviewer MCP, corpus)
         id: app-token
         timeout-minutes: 5
         uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
@@ -262,7 +275,7 @@ jobs:
           # spurious 'rubric unavailable'"), and the fleet spent half an hour
           # failing every lens closed against a defect that was already fixed.
           # See STDIO-661.
-          CAPS_SHA="d692f7cfec0a1b3dd85cf32e8d3d3569e5c096db" # capabilities v0.4.14, 2026-08-03
+          CAPS_SHA="5e22ef67ef60ed8d84d27d3f18356d26971e29cb" # capabilities @ 2026-08-05, hosts scripts/checkout-corpus.sh
           rm -rf "$D"
           # Auth as a repo-local http.extraheader (see the file header for why) — written
           # via a redirect so the token stays out of argv, and masked in logs.
@@ -285,13 +298,44 @@ jobs:
           fi
           test -f "$D/dist/bin.js" && echo "reviewer MCP built at $D/dist/bin.js"
 
+      - name: Check out the guardrails corpus (read it from disk, not the REST API)
+        # WHY A CLONE, stated here and only here. Each lens reads ~15 practice bodies.
+        # Through the contents API that is ~15 REST calls per lens, five lenses per
+        # PR, every PR in the fleet, all against ONE App installation's single
+        # 5000/hr budget — enough that an eleven-repo rollout exhausted it and failed
+        # every job in the fleet closed, plain `ci` included, since minting the token
+        # draws on the same budget (STDIO-663). A clone costs none of that budget,
+        # and a corpus already on disk cannot fail to fetch mid-review (STDIO-661).
+        #
+        # The script lives in the reviewer package, pinned to the same immutable sha
+        # as the reviewer itself, and its guards — fail-closed on an empty corpus,
+        # credential retired even when the fetch fails, bounded fetch — are covered
+        # by tests THERE rather than restated as claims here (STDIO-662). The path
+        # below is the clone the step above just made.
+        #
+        # A shallow clone of a prose repo is seconds; 3m is retry room, not a budget.
+        # The script bounds the fetch itself, so a hung network call names the
+        # operation instead of arriving as an anonymous step timeout.
+        timeout-minutes: 3
+        env:
+          CORPUS_DIR: /home/runner/.antagonistic-review-corpus
+          CORPUS_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: bash "/home/runner/.antagonistic-review-mcp/scripts/checkout-corpus.sh"
+
       - name: Adversarial review against the provisioned practices (this lens)
         id: review
         timeout-minutes: 12 # bound the model invocation specifically, inside the job envelope
         uses: anthropics/claude-code-base-action@e8132bc5e637a42c27763fc757faa37e1ee43b34 # @beta
         env:
-          # the MCP (mcp.json) reads the corpus with this ephemeral, scoped token.
+          # the MCP (mcp.json) still uses this for the work source; the corpus no
+          # longer costs a REST call at all.
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+          # The corpus is read from the checkout above rather than the REST API — a
+          # local path needs no credential and costs no rate-limit budget. MUST
+          # MATCH `CORPUS_DIR` on that step: if it drifts, the lens finds no corpus
+          # and fails closed, which is safe but reads as a verdict on the change
+          # rather than on this file.
+          AIGENCY_GUARDRAILS_URL: /home/runner/.antagonistic-review-corpus
           # the change under review, as commit shas — the working tree is BASE, so the
           # reviewer reads the HEAD only as data — the diff, plus the read-only
           # $HEAD_ROOT extract (never a checked-out, executable tree).

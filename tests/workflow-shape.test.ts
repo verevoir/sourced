@@ -166,3 +166,101 @@ describe('antagonistic-review.yml — the PR-head extract the lenses read', () =
     expect(flat).toMatch(/Review the HEAD through the diff and \$HEAD_ROOT/);
   });
 });
+
+describe('antagonistic-review.yml — the guardrails corpus checkout', () => {
+  it('runs the SHARED script from the pinned reviewer clone, not a local copy', () => {
+    // The point of the shared script is that it is pinned with the reviewer and
+    // tested once. A copy pasted back into this file, or read from the repo's own
+    // tree, would be neither — and the tree one would also be PR-author supplied
+    // on a pull_request_target run.
+    expect(flat).toMatch(
+      /run: bash "\/home\/runner\/\.antagonistic-review-mcp\/scripts\/checkout-corpus\.sh"/
+    );
+    expect(flat).not.toMatch(/run: bash \.?\/?scripts\/checkout-corpus\.sh/);
+  });
+
+  it('runs BEFORE the review step, which is the only ordering that works', () => {
+    // The reviewer reads AIGENCY_GUARDRAILS_URL at start-up. A corpus that arrives
+    // after it has begun is a corpus it never sees — and the failure is a lens that
+    // provisions nothing and auto-REJECTs, which reads as a verdict on the change.
+    const corpusAt = yml.indexOf('name: Check out the guardrails corpus');
+    const reviewAt = yml.indexOf('name: Adversarial review against the provisioned practices');
+    const mcpAt = yml.indexOf('name: Pre-build the reviewer MCP');
+    expect(corpusAt).toBeGreaterThan(-1);
+    expect(reviewAt).toBeGreaterThan(-1);
+    expect(mcpAt).toBeGreaterThan(-1);
+    // And after the MCP pre-build, because the script it runs lives in that clone.
+    expect(corpusAt).toBeGreaterThan(mcpAt);
+    expect(corpusAt).toBeLessThan(reviewAt);
+  });
+
+  it('passes the credential by environment, never in a URL or on argv', () => {
+    expect(flat).toMatch(/CORPUS_TOKEN: \$\{\{ steps\.app-token\.outputs\.token \}\}/);
+    expect(flat).not.toMatch(/x-access-token:\$\{\{/);
+  });
+
+  it('points the reviewer at the SAME directory the checkout writes', () => {
+    // Two literals that must agree. If they drift, the lens finds no corpus and
+    // fails closed — safe, but it reads as a verdict on the change under review
+    // rather than on this file, which is the failure mode the panel is worst at
+    // making legible.
+    const corpusDir = /CORPUS_DIR: (\S+)/.exec(flat)?.[1];
+    const guardrailsUrl = /AIGENCY_GUARDRAILS_URL: (\S+)/.exec(flat)?.[1];
+    expect(corpusDir).toBeDefined();
+    expect(guardrailsUrl).toBe(corpusDir);
+  });
+
+  it('lets a failed corpus checkout STOP the job, rather than review without a bar', () => {
+    // The fail-closed here is structural, not written down: neither the corpus step
+    // nor the review step carries `if: always()`, so a corpus that did not arrive
+    // ends the job before any lens starts. Add `if: always()` to either — an easy
+    // and plausible edit, since this file already carries it three times over — two
+    // later steps and the aggregator job — which makes it look routine
+    // — and the panel reviews against whatever the reviewer can still reach, which
+    // may be nothing at all. That failure is silent by construction: a lens with no
+    // practices still produces a verdict.
+    const stepBoundary = /\n {6}- name: /;
+    const stepFrom = (name: string) => yml.slice(yml.indexOf(`      - name: ${name}`)).split(stepBoundary)[0];
+
+    const corpus = stepFrom('Check out the guardrails corpus');
+    const review = stepFrom('Adversarial review against the provisioned practices');
+    expect(corpus).toContain('checkout-corpus.sh');
+    expect(review).toContain('claude-code-base-action');
+    // Anchored to a real directive — 8 spaces, start of line. A bare substring
+    // match hits the COMMENT above the next step, which explains why THAT one has
+    // `if: always()`, and the assertion fails for a reason that has nothing to do
+    // with the property.
+    const alwaysDirective = /^ {8}if: always\(\)$/m;
+    expect(corpus).not.toMatch(alwaysDirective);
+    expect(review).not.toMatch(alwaysDirective);
+  });
+
+  it('keeps every job envelope above the sum of its step timeouts', () => {
+    // The invariant the comment above `timeout-minutes` claims and nothing checked.
+    // Adding this very step inverted it in cloud-runner, and the comment here was
+    // stale by one omitted step before that — so the tally has now been wrong in
+    // two repos while reading as authoritative in both. (STDIO-664.)
+    const jobs = [...yml.matchAll(/^ {2}([a-z][\w-]*):$/gm)];
+    const checked: string[] = [];
+
+    for (const [index, job] of jobs.entries()) {
+      const body = yml.slice(job.index, jobs[index + 1]?.index ?? yml.length);
+      const envelope = /^ {4}timeout-minutes: (\d+)/m.exec(body);
+      const steps = [...body.matchAll(/^ {8}timeout-minutes: (\d+)/gm)].map((m) => Number(m[1]));
+      const named = [...body.matchAll(/^ {6}- name:/gm)].length;
+      // Fail OPEN on what it cannot decide: a job with no envelope, or one step
+      // left unbounded, is not a finding — it is a case with no verdict available.
+      if (!envelope || steps.length !== named) continue;
+
+      const sum = steps.reduce((total, step) => total + step, 0);
+      expect(
+        Number(envelope[1]),
+        `job '${job[1]}' envelope must exceed its ${sum}m of steps`
+      ).toBeGreaterThan(sum);
+      checked.push(job[1]);
+    }
+
+    // Otherwise a rename that stops the parse matching leaves this passing vacuously.
+    expect(checked).toContain('review');
+  });
+});
