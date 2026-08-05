@@ -249,8 +249,20 @@ jobs:
           D="/home/runner/.antagonistic-review-mcp"
           # Pin the reviewer MCP to an IMMUTABLE commit (not a moveable tag), then
           # `npm ci` against its committed lockfile — integrity-checked, audited and
-          # reproducible, so the rubric-loading dependency is verifiable.
-          CAPS_SHA="2b7a51bf2d4c8afba7faaa59cf5843daa83d6e79"
+          # reproducible, so the rubric-loading dependency is verifiable. The gate
+          # must not be modifiable by the thing it gates: built from `main`, any
+          # merge to capabilities would silently change every repo's reviewer with
+          # no review OF THAT CHANGE as a change.
+          #
+          # BUMP THIS WHEN CAPABILITIES RELEASES. The pin is a control with an
+          # ongoing cost, not a set-once decision, and nothing here pays it
+          # automatically. Left alone it silently withholds fixes to the reviewer
+          # itself — on 2026-08-05 it sat 63 commits and two weeks behind, holding
+          # back `6dec33f` ("retry the corpus read on a transient blip — stop
+          # spurious 'rubric unavailable'"), and the fleet spent half an hour
+          # failing every lens closed against a defect that was already fixed.
+          # See STDIO-661.
+          CAPS_SHA="d692f7cfec0a1b3dd85cf32e8d3d3569e5c096db" # capabilities v0.4.14, 2026-08-03
           rm -rf "$D"
           # Auth as a repo-local http.extraheader (see the file header for why) — written
           # via a redirect so the token stays out of argv, and masked in logs.
