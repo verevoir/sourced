@@ -278,7 +278,7 @@ jobs:
           # spurious 'rubric unavailable'"), and the fleet spent half an hour
           # failing every lens closed against a defect that was already fixed.
           # See STDIO-661.
-          CAPS_SHA="5e22ef67ef60ed8d84d27d3f18356d26971e29cb" # capabilities, corpus-checkout host
+          CAPS_SHA="5e22ef67ef60ed8d84d27d3f18356d26971e29cb" # capabilities @ 2026-08-05, hosts scripts/checkout-corpus.sh
           rm -rf "$D"
           # Auth as a repo-local http.extraheader (see the file header for why) — written
           # via a redirect so the token stays out of argv, and masked in logs.
