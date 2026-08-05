@@ -214,7 +214,8 @@ describe('antagonistic-review.yml — the guardrails corpus checkout', () => {
     // The fail-closed here is structural, not written down: neither the corpus step
     // nor the review step carries `if: always()`, so a corpus that did not arrive
     // ends the job before any lens starts. Add `if: always()` to either — an easy
-    // and plausible edit, since three later steps in this file legitimately have it
+    // and plausible edit, since this file already carries it three times over — two
+    // later steps and the aggregator job — which makes it look routine
     // — and the panel reviews against whatever the reviewer can still reach, which
     // may be nothing at all. That failure is silent by construction: a lens with no
     // practices still produces a verdict.
