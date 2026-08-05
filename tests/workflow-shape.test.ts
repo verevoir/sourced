@@ -210,6 +210,30 @@ describe('antagonistic-review.yml — the guardrails corpus checkout', () => {
     expect(guardrailsUrl).toBe(corpusDir);
   });
 
+  it('lets a failed corpus checkout STOP the job, rather than review without a bar', () => {
+    // The fail-closed here is structural, not written down: neither the corpus step
+    // nor the review step carries `if: always()`, so a corpus that did not arrive
+    // ends the job before any lens starts. Add `if: always()` to either — an easy
+    // and plausible edit, since three later steps in this file legitimately have it
+    // — and the panel reviews against whatever the reviewer can still reach, which
+    // may be nothing at all. That failure is silent by construction: a lens with no
+    // practices still produces a verdict.
+    const stepBoundary = /\n {6}- name: /;
+    const stepFrom = (name: string) => yml.slice(yml.indexOf(`      - name: ${name}`)).split(stepBoundary)[0];
+
+    const corpus = stepFrom('Check out the guardrails corpus');
+    const review = stepFrom('Adversarial review against the provisioned practices');
+    expect(corpus).toContain('checkout-corpus.sh');
+    expect(review).toContain('claude-code-base-action');
+    // Anchored to a real directive — 8 spaces, start of line. A bare substring
+    // match hits the COMMENT above the next step, which explains why THAT one has
+    // `if: always()`, and the assertion fails for a reason that has nothing to do
+    // with the property.
+    const alwaysDirective = /^ {8}if: always\(\)$/m;
+    expect(corpus).not.toMatch(alwaysDirective);
+    expect(review).not.toMatch(alwaysDirective);
+  });
+
   it('keeps every job envelope above the sum of its step timeouts', () => {
     // The invariant the comment above `timeout-minutes` claims and nothing checked.
     // Adding this very step inverted it in cloud-runner, and the comment here was
