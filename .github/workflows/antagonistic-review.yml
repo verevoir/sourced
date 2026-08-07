@@ -350,9 +350,11 @@ jobs:
           # preflight above has already guaranteed at least one exists.
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          # Explicit current Sonnet id. The action's `sonnet` alias resolves to a
-          # stale snapshot some credentials 404 on; pin the id your credential serves.
-          model: claude-sonnet-4-6
+          # Explicit current Sonnet id. The action's `sonnet` alias resolves to
+          # a stale snapshot some credentials 404 on; pin the id your credential
+          # serves. Moved 4-6 -> 5 with the local pre-gate, so the same commit is
+          # judged by the same model in both places (STDIO-681).
+          model: claude-sonnet-5
           allowed_tools: 'Bash,Read,Write,Edit,Glob,Grep,mcp__verevoir__provision'
           # The verevoir MCP (@verevoir/capabilities) gives the reviewer `provision`
           # to DERIVE the rubric from the canonical corpus. If mcp.json is absent the
